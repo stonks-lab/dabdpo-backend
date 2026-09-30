@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Entorno virtual
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Variables de entorno (contienen credenciales)
+.env
+
+# Logs
+*.log
+
+# Datos locales (no subir archivos de datos)
+*.parquet
+*.xlsx
+*.xls
+*.csv
+etl/
