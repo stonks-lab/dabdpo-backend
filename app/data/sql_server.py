@@ -429,14 +429,14 @@ def get_incidencias() -> list[dict]:
 # ── Conexión secundaria (team_bi) ─────────────────────────────────────────────
 
 def get_connection_bi() -> pyodbc.Connection:
-    from app.config import SQL_BI_USER, SQL_BI_PASSWORD
+    from app.config import SQL_BI_USER, SQL_BI_PASSWORD, SQL_BI_DATABASE
     drivers = [d for d in pyodbc.drivers() if "SQL Server" in d]
     if not drivers:
         raise RuntimeError("No hay driver ODBC para SQL Server instalado.")
     driver = sorted(drivers)[-1]
     cs = (
         f"DRIVER={{{driver}}};SERVER={SQL_SERVER};"
-        f"DATABASE={SQL_DATABASE};UID={SQL_BI_USER};PWD={SQL_BI_PASSWORD};"
+        f"DATABASE={SQL_BI_DATABASE};UID={SQL_BI_USER};PWD={SQL_BI_PASSWORD};"
     )
     return pyodbc.connect(cs)
 
@@ -471,7 +471,7 @@ def get_pai_proyectos() -> list[dict]:
 # ── Avance Semanal ────────────────────────────────────────────────────────────
 
 def get_avance_semanal() -> list[dict]:
-    df = query_df_bi("SELECT * FROM dbo.dbo_Avance_Semanal")
+    df = query_df_bi("SELECT * FROM dbo.Avance_Semanal")
     df.columns = [_normalize_col(c) for c in df.columns]
 
     # Normalizar primera columna de fecha (no fecha_carga) a ISO YYYY-MM-DD
@@ -486,3 +486,687 @@ def get_avance_semanal() -> list[dict]:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     return df.fillna('').to_dict('records')
+
+
+# ── Costo Metro ───────────────────────────────────────────────────────────────
+
+_MESES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+
+
+def _ensure_costo_metro_schema(cursor, conn: pyodbc.Connection) -> None:
+    """Crea o migra dbo.CostoMetro para incluir columna campana con PK (anio, mes, campana)."""
+    cursor.execute("""
+        IF NOT EXISTS (
+            SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='CostoMetro'
+        )
+        CREATE TABLE dbo.CostoMetro (
+            anio                    INT           NOT NULL,
+            mes                     INT           NOT NULL,
+            campana                 NVARCHAR(100) NOT NULL,
+            mes_nombre              NVARCHAR(20)  NOT NULL,
+            costo_metro_programado  FLOAT         NOT NULL,
+            costo_metro_real        FLOAT         NOT NULL,
+            costo_metro_ajustado    FLOAT         NOT NULL,
+            brecha                  FLOAT         NOT NULL,
+            fecha_carga             DATETIME      NOT NULL CONSTRAINT DF_CM_fecha DEFAULT GETDATE(),
+            CONSTRAINT PK_CostoMetro PRIMARY KEY (anio, mes, campana)
+        )
+    """)
+    conn.commit()
+    # Agrega campana si la tabla existía sin ella
+    cursor.execute("""
+        IF NOT EXISTS (
+            SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='CostoMetro' AND COLUMN_NAME='campana'
+        )
+        ALTER TABLE dbo.CostoMetro ADD campana NVARCHAR(100) NOT NULL
+            CONSTRAINT DF_CM_campana DEFAULT 'TOTAL'
+    """)
+    conn.commit()
+    # Columnas adicionales por compatibilidad hacia atrás
+    for col, tipo in [("costo_metro_real", "FLOAT NOT NULL DEFAULT 0"),
+                      ("costo_metro_ajustado", "FLOAT NOT NULL DEFAULT 0")]:
+        cursor.execute(f"""
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='CostoMetro' AND COLUMN_NAME='{col}'
+            )
+            ALTER TABLE dbo.CostoMetro ADD {col} {tipo}
+        """)
+    conn.commit()
+    # Migra PK para incluir campana si aún no la tiene
+    cursor.execute("""
+        SELECT COUNT(*) FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='CostoMetro'
+          AND CONSTRAINT_NAME='PK_CostoMetro' AND COLUMN_NAME='campana'
+    """)
+    row = cursor.fetchone()
+    if not (row and row[0] > 0):
+        cursor.execute("""
+            SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='CostoMetro'
+              AND CONSTRAINT_NAME='PK_CostoMetro'
+        """)
+        pk_row = cursor.fetchone()
+        if pk_row and pk_row[0] > 0:
+            cursor.execute("ALTER TABLE dbo.CostoMetro DROP CONSTRAINT PK_CostoMetro")
+            conn.commit()
+        cursor.execute(
+            "ALTER TABLE dbo.CostoMetro ADD CONSTRAINT PK_CostoMetro PRIMARY KEY (anio, mes, campana)"
+        )
+        conn.commit()
+
+
+def upsert_costo_metro(anio: int, mes: int, mes_nombre: str,
+                       programado: float, real: float, ajustado: float, brecha: float,
+                       campana: str = 'TOTAL') -> dict:
+    """INSERT OR UPDATE en dbo.CostoMetro por (anio, mes, campana)."""
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        _ensure_costo_metro_schema(cursor, conn)
+        cursor.execute("""
+            MERGE dbo.CostoMetro AS target
+            USING (SELECT ? AS anio, ? AS mes, ? AS campana) AS src
+              ON target.anio = src.anio AND target.mes = src.mes AND target.campana = src.campana
+            WHEN MATCHED THEN
+              UPDATE SET mes_nombre=?, costo_metro_programado=?,
+                         costo_metro_real=?, costo_metro_ajustado=?,
+                         brecha=?, fecha_carga=GETDATE()
+            WHEN NOT MATCHED THEN
+              INSERT (anio, mes, campana, mes_nombre, costo_metro_programado,
+                      costo_metro_real, costo_metro_ajustado, brecha, fecha_carga)
+              VALUES (?,?,?,?,?,?,?,?,GETDATE());
+        """, anio, mes, campana,
+             mes_nombre, programado, real, ajustado, brecha,
+             anio, mes, campana, mes_nombre, programado, real, ajustado, brecha)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "anio": anio, "mes": mes, "campana": campana, "mes_nombre": mes_nombre,
+        "costo_metro_programado": round(programado, 4),
+        "costo_metro_real":       round(real, 4),
+        "costo_metro_ajustado":   round(ajustado, 4),
+        "brecha":                 round(brecha, 4),
+        "ultima_carga": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def get_costo_metro_historico(campana: str = 'TOTAL') -> list[dict]:
+    try:
+        try:
+            df = query_df("""
+                SELECT anio, mes, mes_nombre, campana,
+                       costo_metro_programado, costo_metro_real, costo_metro_ajustado,
+                       brecha, fecha_carga
+                FROM dbo.CostoMetro
+                WHERE campana = ?
+                ORDER BY anio, mes
+            """, (campana,))
+        except Exception:
+            # Fallback: tabla sin columna campana
+            df = query_df("""
+                SELECT anio, mes, mes_nombre,
+                       costo_metro_programado, costo_metro_real, costo_metro_ajustado,
+                       brecha, fecha_carga
+                FROM dbo.CostoMetro ORDER BY anio, mes
+            """)
+            df['campana'] = 'TOTAL'
+        df['fecha_carga'] = df['fecha_carga'].astype(str)
+        return df.to_dict('records')
+    except Exception:
+        return []
+
+
+def get_costo_metro_ultimo(campana: str = 'TOTAL') -> dict | None:
+    try:
+        try:
+            df = query_df("""
+                SELECT TOP 1 anio, mes, mes_nombre, campana,
+                             costo_metro_programado, costo_metro_real, costo_metro_ajustado,
+                             brecha, fecha_carga
+                FROM dbo.CostoMetro
+                WHERE campana = ?
+                ORDER BY anio DESC, mes DESC
+            """, (campana,))
+        except Exception:
+            df = query_df("""
+                SELECT TOP 1 anio, mes, mes_nombre,
+                             costo_metro_programado, costo_metro_real, costo_metro_ajustado,
+                             brecha, fecha_carga
+                FROM dbo.CostoMetro ORDER BY anio DESC, mes DESC
+            """)
+            if not df.empty:
+                df['campana'] = 'TOTAL'
+        if df.empty:
+            return None
+        row = df.iloc[0].to_dict()
+        row['fecha_carga'] = str(row['fecha_carga'])
+        return row
+    except Exception:
+        return None
+
+
+# ── Configuración DPO ─────────────────────────────────────────────────────────
+
+def _ensure_config_table(cursor) -> None:
+    cursor.execute("""
+        IF NOT EXISTS (
+            SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='ConfigDPO'
+        )
+        CREATE TABLE dbo.ConfigDPO (
+            clave               NVARCHAR(50)  NOT NULL PRIMARY KEY,
+            valor               FLOAT         NOT NULL,
+            descripcion         NVARCHAR(200) NOT NULL DEFAULT '',
+            fecha_actualizacion DATETIME      NOT NULL DEFAULT GETDATE()
+        )
+    """)
+
+
+def upsert_config_dpo(meta_costo_metro: float, meta_tolerancia_brecha: float) -> dict:
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        _ensure_config_table(cursor)
+        for clave, valor, desc in [
+            ("meta_costo_metro",       meta_costo_metro,
+             "Meta de Costo Metro en US$/m"),
+            ("meta_tolerancia_brecha", meta_tolerancia_brecha,
+             "Tolerancia máxima de brecha (fracción, ej: 0.05 = 5%)"),
+        ]:
+            cursor.execute("""
+                MERGE dbo.ConfigDPO AS t
+                USING (SELECT ? AS clave) AS s ON t.clave = s.clave
+                WHEN MATCHED     THEN UPDATE SET valor=?, fecha_actualizacion=GETDATE()
+                WHEN NOT MATCHED THEN INSERT (clave,valor,descripcion) VALUES (?,?,?);
+            """, clave, valor, clave, valor, desc)
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "meta_costo_metro":       meta_costo_metro,
+        "meta_tolerancia_brecha": meta_tolerancia_brecha,
+        "guardado": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def get_config_dpo() -> dict:
+    defaults = {"meta_costo_metro": None, "meta_tolerancia_brecha": None}
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        _ensure_config_table(cursor)
+        conn.commit()
+        conn.close()
+        df = query_df("SELECT clave, valor FROM dbo.ConfigDPO")
+        for _, row in df.iterrows():
+            if row['clave'] in defaults:
+                defaults[row['clave']] = float(row['valor'])
+    except Exception:
+        pass
+    return defaults
+
+
+# ── Registro de cargas ────────────────────────────────────────────────────────
+
+def log_carga(tabla: str, fuente: str,
+              nombre_archivo: str | None = None,
+              usuario: str | None = None) -> None:
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='RegistroCarga'
+            )
+            CREATE TABLE dbo.RegistroCarga (
+                id             INT           IDENTITY(1,1) PRIMARY KEY,
+                tabla          NVARCHAR(100) NOT NULL,
+                fuente         NVARCHAR(50)  NOT NULL DEFAULT 'Plataforma',
+                nombre_archivo NVARCHAR(255) NULL,
+                usuario        NVARCHAR(100) NULL,
+                fecha_carga    DATETIME      NOT NULL DEFAULT GETDATE()
+            )
+        """)
+        cursor.execute(
+            "INSERT INTO dbo.RegistroCarga (tabla, fuente, nombre_archivo, usuario)"
+            " VALUES (?,?,?,?)",
+            tabla, fuente, nombre_archivo, usuario
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_registro_cargas() -> list[dict]:
+    try:
+        df = query_df("""
+            SELECT id, tabla, fuente, nombre_archivo, usuario, fecha_carga
+            FROM dbo.RegistroCarga
+            ORDER BY fecha_carga DESC
+        """)
+        df['fecha_carga'] = df['fecha_carga'].astype(str)
+        return df.to_dict('records')
+    except Exception:
+        return []
+
+
+def get_costo_metro_meses() -> list[dict]:
+    try:
+        df = query_df("""
+            SELECT anio, mes, MIN(mes_nombre) AS mes_nombre, MAX(fecha_carga) AS fecha_carga
+            FROM dbo.CostoMetro
+            GROUP BY anio, mes
+            ORDER BY anio, mes
+        """)
+        df['fecha_carga'] = df['fecha_carga'].astype(str)
+        return df.to_dict('records')
+    except Exception:
+        return []
+
+
+def delete_costo_metro_mes(anio: int, mes: int) -> dict:
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "DELETE FROM dbo.CostoMetro WHERE anio=? AND mes=?", anio, mes
+        )
+        affected = cursor.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return {"eliminado": affected > 0, "anio": anio, "mes": mes}
+
+
+def _get_costo_metro_campanas() -> set[str]:
+    """Retorna el conjunto de campañas presentes en CostoMetro (excluye TOTAL y vacíos)."""
+    try:
+        df = query_df("""
+            SELECT DISTINCT campana FROM dbo.CostoMetro
+            WHERE campana IS NOT NULL AND campana NOT IN ('TOTAL', '')
+        """)
+        return set(df['campana'].dropna().tolist())
+    except Exception:
+        return set()
+
+
+def get_campanas_disponibles() -> list[str]:
+    """
+    Retorna las campañas que existen en CostoMetro más la opción 'Otra campaña'
+    para proyectos que no pertenecen a ninguna de ellas.
+    """
+    camps = sorted(_get_costo_metro_campanas())
+    if camps:
+        camps.append('Otra campaña')
+    return camps
+
+
+def get_proyectos_por_campanas(campanas: list[str]) -> list[str]:
+    """
+    Retorna códigos id_blanco de proyectos pertenecientes a las campañas indicadas.
+    'Otra campaña' mapea a proyectos cuya campaña NO está en CostoMetro.
+    """
+    if not campanas:
+        return []
+
+    regular_camps = [c for c in campanas if c != 'Otra campaña']
+    include_otra  = 'Otra campaña' in campanas
+    costo_metro_camps = _get_costo_metro_campanas() if include_otra else set()
+
+    result: list[str] = []
+
+    for table in ('dbo.dim_inf_proyecto', 'dbo.dim_proyectos'):
+        try:
+            df = query_df(f"SELECT * FROM {table}")
+            if df.empty:
+                continue
+            camp_col = next(
+                (c for c in df.columns if 'camp' in c.lower().replace('\xf1', 'n')),
+                None,
+            )
+            if not camp_col:
+                continue
+            id_col = next(
+                (c for c in df.columns
+                 if 'id_blanco' in c.lower() or c.lower() == 'id_blanco'),
+                None,
+            )
+            if not id_col:
+                code_col, _ = _identify_code_name_cols(df)
+                id_col = code_col
+            if not id_col:
+                continue
+
+            camp_series = df[camp_col].fillna('').astype(str).str.strip()
+
+            if regular_camps:
+                mask = camp_series.isin(regular_camps)
+                result.extend(
+                    df[mask][id_col].dropna().astype(str).str.strip()
+                    .replace('', float('nan')).dropna().unique().tolist()
+                )
+
+            if include_otra:
+                # Proyectos cuya campaña no está en ningún mes cargado de CostoMetro
+                mask_otra = ~camp_series.isin(costo_metro_camps)
+                result.extend(
+                    df[mask_otra][id_col].dropna().astype(str).str.strip()
+                    .replace('', float('nan')).dropna().unique().tolist()
+                )
+
+            if result:
+                return list(dict.fromkeys(result))  # deduplica preservando orden
+        except Exception:
+            continue
+
+    return list(dict.fromkeys(result))
+
+
+# ── Simulación ─────────────────────────────────────────────────────────────────
+
+_CREATE_SIMULACION = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id
+    WHERE s.name = 'dbo' AND t.name = 'Simulacion'
+)
+BEGIN
+    CREATE TABLE dbo.Simulacion (
+        id             INT IDENTITY(1,1) NOT NULL,
+        nombre         NVARCHAR(200)     NOT NULL,
+        usuario        NVARCHAR(100)     NULL,
+        fecha_guardado DATETIME          NOT NULL CONSTRAINT DF_Sim_fecha DEFAULT GETDATE(),
+        CONSTRAINT PK_Simulacion PRIMARY KEY (id)
+    )
+END
+"""
+
+_CREATE_SIMULACION_LINEA = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id
+    WHERE s.name = 'dbo' AND t.name = 'SimulacionLinea'
+)
+BEGIN
+    CREATE TABLE dbo.SimulacionLinea (
+        id                INT IDENTITY(1,1) NOT NULL,
+        simulacion_id     INT               NOT NULL,
+        proyecto          NVARCHAR(300)     NOT NULL,
+        contrato_pyc      NVARCHAR(200)     NOT NULL,
+        tipo_contrato     NVARCHAR(200)     NULL,
+        contrato_asignado NVARCHAR(200)     NOT NULL,
+        tipo_asignacion   NVARCHAR(10)      NOT NULL,
+        saldo_inicial     DECIMAL(18,2)     NULL,
+        moneda            NVARCHAR(10)      NULL,
+        CONSTRAINT PK_SimulacionLinea PRIMARY KEY (id),
+        CONSTRAINT FK_SimLinea_Sim FOREIGN KEY (simulacion_id)
+            REFERENCES dbo.Simulacion(id) ON DELETE CASCADE
+    )
+END
+"""
+
+
+def _ensure_sim_tables(conn: pyodbc.Connection) -> None:
+    c = conn.cursor()
+    c.execute(_CREATE_SIMULACION)
+    c.execute(_CREATE_SIMULACION_LINEA)
+    conn.commit()
+
+
+def get_simulaciones() -> list[dict]:
+    conn = get_connection()
+    try:
+        _ensure_sim_tables(conn)
+    finally:
+        conn.close()
+    try:
+        df = query_df("""
+            SELECT s.id, s.nombre, s.usuario,
+                   FORMAT(s.fecha_guardado, 'yyyy-MM-dd HH:mm') AS fecha_guardado,
+                   COUNT(l.id) AS num_lineas
+            FROM dbo.Simulacion s
+            LEFT JOIN dbo.SimulacionLinea l ON l.simulacion_id = s.id
+            GROUP BY s.id, s.nombre, s.usuario, s.fecha_guardado
+            ORDER BY s.fecha_guardado DESC
+        """)
+        return df.fillna('').to_dict('records')
+    except Exception:
+        return []
+
+
+def get_simulacion_by_id(sim_id: int) -> dict | None:
+    sims = query_df("SELECT id, nombre, usuario FROM dbo.Simulacion WHERE id=?", (sim_id,))
+    if sims.empty:
+        return None
+    sim = sims.iloc[0].fillna('').to_dict()
+    lineas = query_df(
+        "SELECT proyecto, contrato_pyc AS alcance, contrato_asignado, "
+        "tipo_asignacion, CAST(saldo_inicial AS FLOAT) AS saldo_inicial, moneda "
+        "FROM dbo.SimulacionLinea WHERE simulacion_id=?",
+        (sim_id,)
+    )
+    sim['lineas'] = lineas.fillna('').to_dict('records')
+    return sim
+
+
+def save_simulacion(nombre: str, usuario: str | None, lineas: list[dict], sim_id: int | None = None) -> dict:
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        _ensure_sim_tables(conn)
+        if sim_id:
+            cursor.execute(
+                "UPDATE dbo.Simulacion SET nombre=?, usuario=?, fecha_guardado=GETDATE() WHERE id=?",
+                nombre, usuario, sim_id
+            )
+            cursor.execute("DELETE FROM dbo.SimulacionLinea WHERE simulacion_id=?", sim_id)
+            new_id = sim_id
+        else:
+            cursor.execute(
+                "INSERT INTO dbo.Simulacion (nombre, usuario) OUTPUT INSERTED.id VALUES (?,?)",
+                nombre, usuario
+            )
+            new_id = cursor.fetchone()[0]
+
+        for l in lineas:
+            # contrato_pyc column reused to store alcance (dupla key)
+            cursor.execute(
+                "INSERT INTO dbo.SimulacionLinea "
+                "(simulacion_id, proyecto, contrato_pyc, "
+                " contrato_asignado, tipo_asignacion, saldo_inicial, moneda) "
+                "VALUES (?,?,?,?,?,?,?)",
+                new_id, l['proyecto'], l.get('alcance', ''),
+                l['contrato_asignado'], l['tipo_asignacion'],
+                l.get('saldo_inicial'), l.get('moneda', 'CLP'),
+            )
+        conn.commit()
+        return {'id': int(new_id), 'ok': True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_simulacion(sim_id: int) -> dict:
+    conn   = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM dbo.Simulacion WHERE id=?", sim_id)
+        conn.commit()
+        return {'ok': True}
+    finally:
+        conn.close()
+
+
+def _identify_code_name_cols(df: pd.DataFrame) -> tuple[str | None, str | None]:
+    """
+    Identifica columna código y columna nombre por contenido:
+    - código: valores solo alfanuméricos (sin espacios ni guiones ni tildes)
+    - nombre: valores con espacios, guiones, tildes u otros caracteres especiales
+    """
+    str_cols = [c for c in df.columns if df[c].dtype == object]
+    if len(str_cols) < 2:
+        return None, None
+
+    def _pct_code(col: str) -> float:
+        vals = df[col].dropna().astype(str).str.strip()
+        vals = vals[vals != '']
+        return float(vals.str.match(r'^[A-Za-z0-9_]+$').mean()) if not vals.empty else 0.0
+
+    def _pct_name(col: str) -> float:
+        vals = df[col].dropna().astype(str).str.strip()
+        vals = vals[vals != '']
+        return float(vals.str.contains(r'[\s\-áéíóúÁÉÍÓÚñÑüÜ,\(\)\./]', regex=True, na=False).mean()) if not vals.empty else 0.0
+
+    code_col = max(str_cols, key=_pct_code)
+    name_col = max((c for c in str_cols if c != code_col), key=_pct_name, default=None)
+
+    if not name_col or _pct_code(code_col) < 0.5 or _pct_name(name_col) < 0.2:
+        return None, None
+
+    return code_col, name_col
+
+
+def _dim_proyecto_nombres() -> dict[str, str]:
+    """Obtiene {id_blanco: nombre} identificando columnas por contenido."""
+    for table in ('dbo.dim_inf_proyecto', 'dbo.dim_proyectos'):
+        try:
+            df = query_df(f"SELECT * FROM {table}")
+            if df.empty:
+                continue
+            code_col, name_col = _identify_code_name_cols(df)
+            if code_col and name_col:
+                mapping = df.set_index(code_col)[name_col].dropna()
+                mapping = mapping[mapping.astype(str).str.strip() != '']
+                if not mapping.empty:
+                    return mapping.to_dict()
+        except Exception:
+            continue
+    return {}
+
+
+def get_sim_proyectos() -> dict:
+    try:
+        df = query_df(
+            "SELECT DISTINCT proyecto FROM dbo.proyecciones "
+            "WHERE proyecto IS NOT NULL AND proyecto != '' ORDER BY proyecto"
+        )
+        codigos: list[str] = df['proyecto'].dropna().tolist()
+    except Exception:
+        return {'proyectos': [], 'has_nombres': False}
+
+    # nombres primarios desde dim_inf_proyecto (nom_resumen)
+    nombre_map = _dim_proyecto_nombres()
+
+    # fallback: sourcing_plan.id_blanco → sourcing_plan.proyecto (nombre)
+    sourcing_nombre_map: dict[str, str] = {}
+    try:
+        sp = query_df(
+            "SELECT id_blanco, MAX(proyecto) AS nombre "
+            "FROM dbo.sourcing_plan "
+            "WHERE id_blanco IS NOT NULL AND id_blanco != '' "
+            "GROUP BY id_blanco"
+        )
+        sourcing_nombre_map = sp.set_index('id_blanco')['nombre'].dropna().to_dict()
+    except Exception:
+        pass
+
+    proyectos = []
+    for cod in codigos:
+        nombre = nombre_map.get(cod, '') or sourcing_nombre_map.get(cod, '')
+        proyectos.append({
+            'codigo':    cod,
+            'nombre':    nombre,
+            'id_blanco': cod,   # en proyecciones, proyecto ya es el id_blanco
+        })
+
+    has_nombres = any(p['nombre'] and p['nombre'] != p['codigo'] for p in proyectos)
+    return {
+        'proyectos':   proyectos,
+        'has_nombres': has_nombres,
+    }
+
+
+def get_sim_vendor_codes(proyectos: list[str]) -> list[dict]:
+    """Retorna una fila por dupla (proyecto, alcance) con periodos agregados."""
+    if not proyectos:
+        return []
+    ph = ','.join(['?'] * len(proyectos))
+    # Get per-contract-period rows with alcance
+    df = query_df(
+        f"""
+        SELECT p.contrato, p.proyecto, p.periodo,
+               SUM(p.monto_proyectado) AS monto,
+               MAX(p.moneda)           AS moneda,
+               COALESCE(MAX(s.alcance), '')  AS alcance
+        FROM dbo.proyecciones p
+        LEFT JOIN dbo.sourcing_plan s ON s.contrato = p.contrato
+        WHERE p.proyecto IN ({ph})
+        GROUP BY p.contrato, p.proyecto, p.periodo
+        """,
+        tuple(proyectos)
+    )
+    if df.empty:
+        return []
+
+    df['alcance'] = df['alcance'].fillna('').astype(str)
+    df['moneda']  = df['moneda'].fillna('CLP').astype(str)
+
+    result = []
+    # Group by (proyecto, alcance) — one row per dupla
+    for (proyecto_val, alcance_val), grp in df.groupby(['proyecto', 'alcance'], sort=True):
+        # Aggregate periods across all contracts in this dupla
+        period_sums = grp.groupby('periodo')['monto'].sum().reset_index()
+        periodos = sorted(
+            [{'periodo': str(r['periodo']), 'monto': float(r['monto'] or 0)}
+             for _, r in period_sums.iterrows()],
+            key=lambda x: x['periodo']
+        )
+        contratos_pyc = sorted(grp['contrato'].astype(str).unique().tolist())
+        moneda = str(grp['moneda'].iloc[0])
+
+        result.append({
+            'proyecto':         str(proyecto_val),
+            'alcance':          str(alcance_val),
+            'contratos_pyc':    contratos_pyc,
+            'moneda':           moneda,
+            'total_proyectado': float(grp['monto'].sum()),
+            'periodo_inicio':   periodos[0]['periodo']  if periodos else '',
+            'periodo_fin':      periodos[-1]['periodo'] if periodos else '',
+            'periodos':         periodos,
+        })
+    return result
+
+
+def get_sim_contratos() -> dict:
+    import json as _json
+    from app.metrics.calculations import saldo_por_contrato
+    from app.data.loader import load_solpe
+
+    sic = saldo_por_contrato()
+    sic_cols = [c for c in ['codigo_ctt', 'Descripcion_ctt', 'Tipo_contrato',
+                             'Saldo_CLP', 'Presupuesto_CLP', 'Estado_ctt'] if c in sic.columns]
+    sic_df = sic[sic_cols].copy()
+    for col in ('Saldo_CLP', 'Presupuesto_CLP'):
+        if col in sic_df.columns:
+            sic_df[col] = pd.to_numeric(sic_df[col], errors='coerce').fillna(0)
+    sic_list = _json.loads(sic_df.to_json(orient='records'))
+
+    solpe = load_solpe()
+    solpe_cols = [c for c in ['Código', 'Nombre', 'Tipo', 'Monto', 'Moneda',
+                               'Estado_SOLPE', 'Grupo_Estado'] if c in solpe.columns]
+    solpe_df = solpe[solpe_cols].copy()
+    if 'Monto' in solpe_df.columns:
+        solpe_df['Monto'] = pd.to_numeric(solpe_df['Monto'], errors='coerce').fillna(0)
+    solpe_list = _json.loads(solpe_df.to_json(orient='records'))
+
+    return {'sic': sic_list, 'solpes': solpe_list}

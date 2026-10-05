@@ -1,4 +1,5 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
+from typing import Optional
 from app.metrics.calculations import alertas_contratos, alertas_boletas
 from app.data.loader import load_boletas
 
@@ -24,5 +25,12 @@ def get_contratos():
 
 
 @router.get("/boletas")
-def get_boletas():
-    return alertas_boletas()
+def get_boletas(
+    estado_ctt: Optional[str] = Query(None),
+    area:       Optional[str] = Query(None),
+    tipo:       Optional[str] = Query(None),
+    proyecto:   Optional[str] = Query(None),
+    contrato:   Optional[str] = Query(None),
+    campana:    Optional[str] = Query(None),
+):
+    return alertas_boletas(estado_ctt or '', area or '', tipo or '', proyecto or '', contrato or '', campana or '')

@@ -22,9 +22,14 @@ SQL_AUTH     = os.environ.get("SQL_AUTH", "sql")
 SQL_USER     = os.environ.get("SQL_USER", "")
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")
 
-# Credenciales secundarias (lectura tablas avance/PAI)
+# Credenciales secundarias (lectura tablas avance/PAI en BI_dev)
 SQL_BI_USER     = os.environ.get("SQL_BI_USER", "")
 SQL_BI_PASSWORD = os.environ.get("SQL_BI_PASSWORD", "")
+SQL_BI_DATABASE = os.environ.get("SQL_BI_DATABASE", "BI_dev")
 
 SQL_PROYECCIONES_ENABLED = True
 SQL_SOURCING_ENABLED     = True
+
+# ── Monday.com ─────────────────────────────────────────────────────────────────
+MONDAY_API_KEY  = os.environ.get("MONDAY_API_KEY", "")
+MONDAY_BOARD_ID = int(os.environ.get("MONDAY_BOARD_ID", "0"))

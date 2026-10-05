@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from app.routers import home, saldo, licitaciones, alertas, proyecciones, analisis, sourcing, upload, estado_proyectos, metros
+from app.routers import home, saldo, licitaciones, alertas, proyecciones, analisis, sourcing, upload, estado_proyectos, metros, monday, dpo, simulacion
 
 app = FastAPI(title="Tablero DAB-DPO API", version="1.0")
 
@@ -24,6 +24,9 @@ app.include_router(sourcing.router,     prefix="/api")
 app.include_router(upload.router,           prefix="/api")
 app.include_router(estado_proyectos.router, prefix="/api")
 app.include_router(metros.router,           prefix="/api")
+app.include_router(monday.router,           prefix="/api")
+app.include_router(dpo.router,              prefix="/api")
+app.include_router(simulacion.router,       prefix="/api")
 
 
 @app.get("/api/health")
