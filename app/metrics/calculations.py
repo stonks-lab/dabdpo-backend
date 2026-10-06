@@ -254,6 +254,9 @@ def saldo_timeline(
                 mes_agotamiento = m
                 break
 
+        # Último período con EP real registrado
+        ultimo_ep: str | None = max(ep_ctt.keys(), default=None) if ep_ctt else None
+
         result.append({
             'codigo_ctt':       ctt,
             'descripcion':      str(row.get('Descripcion_ctt', '') or ''),
@@ -265,6 +268,7 @@ def saldo_timeline(
             'pct_saldo':        float(row.get('Pct_Saldo', 0) or 0),
             'estado_saldo':     str(row.get('Estado_Saldo',   '') or ''),
             'mes_agotamiento':  mes_agotamiento,
+            'ultimo_ep':        ultimo_ep,
             'tiene_proyeccion': bool(proy_ctt),
             'saldos':           saldos,
         })
