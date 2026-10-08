@@ -42,3 +42,12 @@ def get_tabla():
     _check()
     from app.data.sql_server import get_sourcing_tabla
     return get_sourcing_tabla()
+
+
+@router.get("/cobertura-metros")
+def get_cobertura_metros():
+    _check()
+    from app.data.sql_server import get_sourcing_cobertura_metros
+    return get_sourcing_cobertura_metros()
+
+

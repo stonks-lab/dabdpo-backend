@@ -28,6 +28,24 @@ async def upload_proyecciones_pyc(file: UploadFile = File(...), usuario: str = "
     return result
 
 
+@router.post("/proyecciones-adc")
+async def upload_proyecciones_adc(file: UploadFile = File(...), usuario: str = ""):
+    if not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos .xlsx o .xls")
+
+    content = await file.read()
+    try:
+        from app.data.sql_server import load_proyecciones_adc, log_carga
+        result = load_proyecciones_adc(content)
+        log_carga("dbo.proyecciones", "Plataforma", file.filename, usuario or None)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al cargar en SQL Server: {e}")
+
+    return result
+
+
 @router.post("/dimensiones")
 async def upload_dimensiones(file: UploadFile = File(...), usuario: str = ""):
     if not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):

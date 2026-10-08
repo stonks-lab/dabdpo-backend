@@ -43,12 +43,18 @@ def get_por_mes():
 @router.get("/tabla")
 def get_tabla(
     contrato:      Optional[str] = Query(None),
+    proyecto:      Optional[str] = Query(None, description="Código ID_BLANCO"),
     periodo_desde: Optional[str] = Query(None, description="Formato YYYY-MM"),
+    periodo_hasta: Optional[str] = Query(None, description="Formato YYYY-MM"),
     tipo:          Optional[str] = Query(None, description="P&C o AdC"),
 ):
     _check()
     from app.data.sql_server import get_proyecciones
-    df = get_proyecciones(contrato=contrato, periodo_desde=periodo_desde, tipo=tipo)
+    df = get_proyecciones(
+        contrato=contrato, proyecto=proyecto,
+        periodo_desde=periodo_desde, periodo_hasta=periodo_hasta,
+        tipo=tipo,
+    )
     return df.fillna("").to_dict("records")
 
 
@@ -58,6 +64,44 @@ def get_vs_ep(periodo_desde: Optional[str] = Query(None)):
     from app.data.sql_server import get_proyecciones_vs_ep
     df = get_proyecciones_vs_ep(periodo_desde=periodo_desde)
     return df.fillna(0).to_dict("records")
+
+
+@router.get("/comparacion")
+def get_comparacion(
+    contrato:      Optional[str] = Query(None),
+    proyecto:      Optional[str] = Query(None),
+    periodo_desde: Optional[str] = Query(None),
+    periodo_hasta: Optional[str] = Query(None),
+):
+    _check()
+    import pandas as pd
+    from app.data.sql_server import get_proyecciones
+
+    df = get_proyecciones(
+        contrato=contrato, proyecto=proyecto,
+        periodo_desde=periodo_desde, periodo_hasta=periodo_hasta,
+    )
+    if df.empty:
+        return []
+
+    tipo_map = df.drop_duplicates('contrato').set_index('contrato')['tipo_servicio'].to_dict() \
+        if 'tipo_servicio' in df.columns else {}
+
+    grp = df.groupby(['contrato', 'proyecto', 'tipo_proyeccion'])['monto_proyectado'].sum().unstack(fill_value=0)
+    grp.columns.name = None
+    grp = grp.reset_index()
+
+    if 'P&C' not in grp.columns: grp['P&C'] = 0.0
+    if 'AdC' not in grp.columns: grp['AdC'] = 0.0
+
+    grp['diferencia'] = grp['P&C'] - grp['AdC']
+    grp = grp.rename(columns={'P&C': 'pyc', 'AdC': 'adc'})
+    contratos_con_adc = set(grp.loc[grp['adc'] > 0, 'contrato'].unique())
+    grp = grp[grp['contrato'].isin(contratos_con_adc)]
+    grp = grp.sort_values(['contrato', 'adc', 'pyc'], ascending=[True, False, False])
+    grp['tipo_servicio'] = grp['contrato'].map(tipo_map).fillna('')
+
+    return grp[['contrato', 'proyecto', 'tipo_servicio', 'pyc', 'adc', 'diferencia']].fillna(0).to_dict('records')
 
 
 def _norm_ctt(code: str) -> str:
@@ -116,6 +160,7 @@ def _load_sic_ep() -> tuple[dict[str, dict[str, float]], dict[str, str]]:
 @router.get("/timeline")
 def get_timeline(
     contrato:   Optional[str] = Query(None),
+    tipo:       Optional[str] = Query(None, description="P&C, AdC o vacío para ambos"),
     meses_hist: int           = Query(3),
     meses_fut:  int           = Query(24),
     limite:     int           = Query(20),
@@ -129,7 +174,7 @@ def get_timeline(
     hist_ini = (today - pd.DateOffset(months=meses_hist)).to_period('M').to_timestamp()
     hist_str = hist_ini.strftime('%Y-%m')
 
-    df = get_proyecciones(contrato=contrato)
+    df = get_proyecciones(contrato=contrato, tipo=tipo)
     if df.empty:
         return {'meses': [], 'mes_actual': mes_act, 'mes_actual_idx': 0,
                 'contratos': [], 'totales_mes': [], 'ultimo_ep': None}
