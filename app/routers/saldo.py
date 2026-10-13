@@ -67,12 +67,25 @@ def get_filtros():
         sorted(df["alcance"].dropna().replace("", float("nan")).dropna().unique().tolist())
         if "alcance" in df.columns else []
     )
+    proyectos: list[str] = []
+    try:
+        from app.config import SQL_PROYECCIONES_ENABLED
+        if SQL_PROYECCIONES_ENABLED:
+            from app.data.sql_server import get_proyecciones as _gp
+            proy_df = _gp()
+            if not proy_df.empty and 'proyecto' in proy_df.columns:
+                proyectos = sorted(
+                    proy_df['proyecto'].replace('', float('nan')).dropna().unique().tolist()
+                )
+    except Exception:
+        pass
     return {
         "areas":         sorted(df["Area_contrato"].dropna().unique().tolist()),
         "tipos":         sorted(df["Tipo_contrato"].dropna().unique().tolist()),
         "estados_ctt":   sorted(df["Estado_ctt"].dropna().unique().tolist()),
         "estados_saldo": ["NEGATIVO", "CRÍTICO", "ADVERTENCIA", "ATENCIÓN", "OK"],
         "alcances":      alcances,
+        "proyectos":     proyectos,
     }
 
 
@@ -83,15 +96,17 @@ def get_evolucion():
 
 @router.get("/timeline")
 def get_timeline(
-    area:         Optional[str] = Query(None),
-    tipo:         Optional[str] = Query(None),
-    estado_ctt:   Optional[str] = Query(None),
-    contrato:     Optional[str] = Query(None),
-    estado_saldo: Optional[str] = Query(None),
-    alcance:      Optional[str] = Query(None),
-    meses_hist:   int           = Query(12),
-    meses_fut:    int           = Query(18),
-    limite:       int           = Query(60),
+    area:             Optional[str] = Query(None),
+    tipo:             Optional[str] = Query(None),
+    estado_ctt:       Optional[str] = Query(None),
+    contrato:         Optional[str] = Query(None),
+    estado_saldo:     Optional[str] = Query(None),
+    alcance:          Optional[str] = Query(None),
+    proyecto:         Optional[str] = Query(None),
+    tipo_proyeccion:  Optional[str] = Query(None),
+    meses_hist:       int           = Query(12),
+    meses_fut:        int           = Query(18),
+    limite:           int           = Query(60),
 ):
     from app.metrics.calculations import saldo_timeline
     return saldo_timeline(
@@ -101,6 +116,8 @@ def get_timeline(
         contrato=contrato or '',
         estado_saldo=estado_saldo or '',
         alcance=alcance or '',
+        proyecto=proyecto or '',
+        tipo_proyeccion=tipo_proyeccion or '',
         meses_hist=meses_hist,
         meses_fut=meses_fut,
         limite=limite,

@@ -138,15 +138,17 @@ def saldo_timeline(
     contrato: str = '',
     estado_saldo: str = '',
     alcance: str = '',
+    proyecto: str = '',
+    tipo_proyeccion: str = '',  # '', 'P&C', 'AdC', 'P&C+AdC'
     meses_hist: int = 12,
     meses_fut:  int = 18,
     limite: int = 60,
 ) -> dict:
     """
-    Devuelve la evolución del saldo por contrato:
-    - Histórico: presupuesto − Σ(EP hasta T)
-    - Mes actual: saldo_actual (ancla real)
-    - Futuro: saldo_actual − Σ(proyecciones P&C hasta T)
+    Devuelve la evolución del saldo por contrato anclado en ultimo_ep:
+    - Mes de ultimo_ep : saldo_actual (valor real SIC)
+    - Meses anteriores : saldo_actual + Σ(EP desde m+1 hasta ultimo_ep)
+    - Meses posteriores: saldo_actual − Σ(proyecciones desde ultimo_ep+1 hasta m)
     """
     ep       = load_ep()
     saldo_df = saldo_por_contrato()
@@ -171,28 +173,85 @@ def saldo_timeline(
     today      = pd.Timestamp.now().to_period('M').to_timestamp()
     mes_actual = today.strftime('%Y-%m')
     hist_start = (today - pd.DateOffset(months=meses_hist)).to_period('M').to_timestamp()
-    hist_start_str = hist_start.strftime('%Y-%m')
 
-    # Proyecciones convertidas a CLP
+    # Parsear selección de proyección (puede ser combinación: 'P&C,AdC', 'Lineal', 'P&C,Lineal', …)
+    tipos_proj   = [t.strip() for t in tipo_proyeccion.split(',') if t.strip()] if tipo_proyeccion else []
+    usa_lineal   = 'Lineal' in tipos_proj
+    tipos_pyc    = [t for t in tipos_proj if t != 'Lineal']  # P&C y/o AdC seleccionados
+
+    # Promedio mensual EP por contrato (para proyección Lineal)
+    ep_lineal_avg: dict[str, float] = {}
+    if usa_lineal:
+        ep_cp = ep.copy()
+        if 'Fecha_Periodo' in ep_cp.columns:
+            ep_cp['_per'] = ep_cp['Fecha_Periodo'].dt.strftime('%Y-%m')
+        else:
+            ep_cp['_per'] = ''
+        ag = ep_cp.groupby('codigo_ctt').agg(
+            _total=('monto_CLP', 'sum'),
+            _meses=('_per', 'nunique'),
+        )
+        for ctt_e, row_e in ag.iterrows():
+            ep_lineal_avg[str(ctt_e)] = float(row_e['_total']) / max(int(row_e['_meses']), 1)
+
+    # Proyecciones convertidas a CLP — filtradas por tipo si se indica
     proy_grp: dict[str, dict[str, float]] = {}
+    proy_proyectos: dict[str, set[str]] = {}   # contrato_key -> proyectos únicos
     try:
         from app.config import SQL_PROYECCIONES_ENABLED
         if SQL_PROYECCIONES_ENABLED:
             from app.data.sql_server import get_proyecciones as _gproy
-            proy_df = _gproy()
+            if len(tipos_pyc) == 1:
+                tipo_fil = tipos_pyc[0]
+            elif not tipos_pyc:
+                tipo_fil = None if usa_lineal else None  # sin P&C/AdC seleccionado
+            else:
+                tipo_fil = None  # P&C + AdC → todos
+            # Si solo se seleccionó Lineal, no cargar proyecciones P&C/AdC
+            proy_df  = _gproy(tipo=tipo_fil) if (tipos_pyc or not usa_lineal) else __import__('pandas').DataFrame()
             if not proy_df.empty:
                 fx = _fx_rates()
                 for _, pr in proy_df.iterrows():
-                    ctt_key = str(pr.get('contrato', '') or '').strip()
-                    per     = str(pr.get('periodo',   '') or '').strip()
-                    mon     = str(pr.get('moneda',    'CLP') or 'CLP').strip().upper()
-                    amt     = float(pr.get('monto_proyectado', 0) or 0)
+                    ctt_key  = str(pr.get('contrato', '') or '').strip()
+                    per      = str(pr.get('periodo',   '') or '').strip()
+                    mon      = str(pr.get('moneda',    'CLP') or 'CLP').strip().upper()
+                    amt      = float(pr.get('monto_proyectado', 0) or 0)
+                    _proj = str(pr.get('proyecto',  '') or '').strip()
                     if ctt_key and per:
                         proy_grp.setdefault(ctt_key, {})[per] = (
                             proy_grp.get(ctt_key, {}).get(per, 0) + amt * fx.get(mon, 1.0)
                         )
+                        if _proj and _proj.lower() not in ('nan', 'none', ''):
+                            proy_proyectos.setdefault(ctt_key, set()).add(_proj)
     except Exception:
         pass
+
+    # Filtrar por proyecto: mantener solo contratos que tengan proyección para ese proyecto
+    if proyecto:
+        proj_col = next((c for c in ep.columns if c.lower() == 'proyecto'), None)
+        if proj_col:
+            ctts_for_proj = set(ep[ep[proj_col] == proyecto]['codigo_ctt'].astype(str))
+            # también buscar en proyecciones P&C (clave con y sin CO-)
+            for k, rows in proy_proyectos.items():
+                if proyecto in rows:
+                    ctts_for_proj.add(k)
+                    ctts_for_proj.add(k[3:] if k.startswith('CO-') else 'CO-' + k)
+            saldo_df = saldo_df[saldo_df['codigo_ctt'].isin(ctts_for_proj)]
+
+    # Normalización de códigos: si un código de proyección (p.ej. "CO-009/2025") no existe
+    # como tal en SIC, construir un índice secundario sin el prefijo "CO-" para que coincida
+    # con el código SIC (p.ej. "009/2025"). Los códigos SIC que SÍ tienen prefijo "CO-" se
+    # resuelven por coincidencia exacta y no se re-mapean.
+    valid_sic_codes: set[str] = set(saldo_df['codigo_ctt'].astype(str))
+    proy_grp_stripped: dict[str, dict[str, float]] = {}
+    for k, v in proy_grp.items():
+        if k not in valid_sic_codes and k.startswith('CO-'):
+            stripped = k[3:]
+            if stripped not in proy_grp:  # no pisar coincidencia exacta existente
+                for per, amt in v.items():
+                    proy_grp_stripped.setdefault(stripped, {})[per] = (
+                        proy_grp_stripped.get(stripped, {}).get(per, 0) + amt
+                    )
 
     # Horizonte futuro: hasta el último mes con proyección, mínimo meses_fut
     max_proy_per = max(
@@ -213,7 +272,7 @@ def saldo_timeline(
     month_list: list[str] = [m.strftime('%Y-%m') for m in months]
     mes_actual_idx = month_list.index(mes_actual) if mes_actual in month_list else len(month_list) - 1
 
-    # EP agrupado por contrato y período (todos los períodos, no solo la ventana)
+    # EP agrupado por contrato y período (sin restricción de ventana — necesario para cálculo hacia atrás)
     ep_grp: dict[str, dict[str, float]] = {}
     if not ep.empty and 'Fecha_Periodo' in ep.columns:
         ep_c = ep[['codigo_ctt', 'Fecha_Periodo', 'monto_CLP']].copy()
@@ -225,45 +284,80 @@ def saldo_timeline(
     result: list[dict] = []
     for _, row in saldo_df.iterrows():
         ctt         = str(row['codigo_ctt'])
-        presupuesto = float(row.get('Presupuesto_CLP', 0) or 0)
         saldo_act   = float(row.get('Saldo_CLP', 0) or 0)
-        ep_ctt      = ep_grp.get(ctt, {})
-        proy_ctt    = proy_grp.get(ctt, {})
+        ep_ctt   = ep_grp.get(ctt, {})
+        proy_ctt = proy_grp.get(ctt) or proy_grp_stripped.get(ctt, {})
 
-        # EP consumido antes de la ventana de visualización
-        ep_antes = sum(v for k, v in ep_ctt.items() if k < hist_start_str)
+        # Anchor: último período con EP real registrado
+        ultimo_ep: str | None = max(ep_ctt.keys(), default=None) if ep_ctt else None
 
-        saldos: list[float] = []
-        cum_ep   = ep_antes
-        cum_proy = 0.0
+        saldos = [0.0] * len(month_list)
 
-        for m in month_list:
-            if m < mes_actual:
-                cum_ep += ep_ctt.get(m, 0)
-                saldos.append(round(presupuesto - cum_ep))
-            elif m == mes_actual:
-                saldos.append(round(saldo_act))   # ancla con el valor real
-            else:
-                cum_proy += proy_ctt.get(m, 0)
-                saldos.append(round(saldo_act - cum_proy))
+        # Proyección efectiva por mes: P&C/AdC donde existe, Lineal donde no hay dato
+        lineal_avg = ep_lineal_avg.get(ctt, 0) if usa_lineal else 0
 
-        # Primer mes futuro con saldo ≤ 0
+        def _proy(m: str) -> float:
+            v = proy_ctt.get(m, 0)
+            return v if v else lineal_avg
+
+        if ultimo_ep is None:
+            # Sin EP: mostrar saldo_act plano en histórico, proyectar hacia adelante
+            running = saldo_act
+            for i, m in enumerate(month_list):
+                if m <= mes_actual:
+                    saldos[i] = round(saldo_act)
+                else:
+                    running -= _proy(m)
+                    saldos[i] = round(running)
+        elif ultimo_ep in month_list:
+            uep_idx = month_list.index(ultimo_ep)
+            saldos[uep_idx] = round(saldo_act)
+
+            # Hacia atrás: saldo(m) = saldo(m+1) + EP(m+1)
+            running = saldo_act
+            for i in range(uep_idx - 1, -1, -1):
+                running += ep_ctt.get(month_list[i + 1], 0)
+                saldos[i] = round(running)
+
+            # Hacia adelante: saldo(m) = saldo(m-1) - proyeccion(m)
+            running = saldo_act
+            for i in range(uep_idx + 1, len(month_list)):
+                running -= _proy(month_list[i])
+                saldos[i] = round(running)
+        elif ultimo_ep < month_list[0]:
+            # Anchor antes de la ventana: todo en la ventana es "futuro"
+            running = saldo_act
+            for i, m in enumerate(month_list):
+                running -= _proy(m)
+                saldos[i] = round(running)
+        else:
+            # Anchor después de la ventana (caso raro): todo histórico
+            running = saldo_act
+            for i in range(len(month_list) - 1, -1, -1):
+                running += ep_ctt.get(month_list[i + 1] if i + 1 < len(month_list) else ultimo_ep, 0)
+                saldos[i] = round(running)
+
+        # Primer mes después de ultimo_ep (o mes_actual si no hay EP) con saldo ≤ 0
+        anchor_agot = ultimo_ep or mes_actual
         mes_agotamiento: str | None = None
         for i, m in enumerate(month_list):
-            if m > mes_actual and saldos[i] <= 0:
+            if m > anchor_agot and saldos[i] <= 0:
                 mes_agotamiento = m
                 break
 
-        # Último período con EP real registrado
-        ultimo_ep: str | None = max(ep_ctt.keys(), default=None) if ep_ctt else None
+        # Proyectos desde tabla de proyecciones (CO- y sin prefijo)
+        _proy_set = proy_proyectos.get(ctt, set()) | proy_proyectos.get('CO-' + ctt, set())
+        _proyectos_str = ', '.join(sorted(_proy_set)) if _proy_set else ''
 
         result.append({
             'codigo_ctt':       ctt,
             'descripcion':      str(row.get('Descripcion_ctt', '') or ''),
             'area':             str(row.get('Area_contrato',   '') or ''),
             'tipo':             str(row.get('Tipo_contrato',   '') or ''),
+            'alcance':          str(row.get('alcance',         '') or ''),
+            'proyectos':        _proyectos_str,
             'estado_ctt':       str(row.get('Estado_ctt',      '') or ''),
-            'presupuesto':      presupuesto,
+            'presupuesto':      float(row.get('Presupuesto_CLP', 0) or 0),
             'saldo_actual':     saldo_act,
             'pct_saldo':        float(row.get('Pct_Saldo', 0) or 0),
             'estado_saldo':     str(row.get('Estado_Saldo',   '') or ''),
@@ -286,10 +380,9 @@ def saldo_timeline(
     # Recortar columnas: máximo 36 meses (12 hist + actual + 23 fut) para no saturar la tabla
     max_cols = meses_hist + 1 + min(meses_fut, 23)
     if len(month_list) > max_cols:
-        # Asegurarse de que el mes actual esté incluido
         start = max(0, mes_actual_idx - meses_hist)
         end   = start + max_cols
-        month_list    = month_list[start:end]
+        month_list     = month_list[start:end]
         mes_actual_idx = mes_actual_idx - start
         for r in result:
             r['saldos'] = r['saldos'][start:end]
@@ -638,6 +731,209 @@ def analisis_contratos_por_proyecto(proyecto: str | None = None) -> list[dict]:
         .fillna("")
         .to_dict("records")
     )
+
+
+# ── Estados de Pago ────────────────────────────────────────────────────────────
+
+def _ep_base(
+    area: str = '',
+    tipo: str = '',
+    contrato: str = '',
+    estado_ctt: str = '',
+    proyecto: str = '',
+    periodo_desde: str = '',
+    periodo_hasta: str = '',
+) -> pd.DataFrame:
+    ep = load_ep()
+    if 'Fecha_Periodo' not in ep.columns:
+        return ep
+    ep = ep.copy()
+    ep['periodo'] = ep['Fecha_Periodo'].dt.strftime('%Y-%m')
+
+    if area       and 'Area_contrato' in ep.columns:
+        ep = ep[ep['Area_contrato'] == area]
+    if tipo       and 'Tipo_contrato' in ep.columns:
+        ep = ep[ep['Tipo_contrato'] == tipo]
+    if estado_ctt and 'Estado_ctt' in ep.columns:
+        ep = ep[ep['Estado_ctt'] == estado_ctt]
+    if proyecto:
+        proj_col = next((c for c in ep.columns if c.lower() == 'proyecto'), None)
+        if proj_col:
+            ep = ep[ep[proj_col] == proyecto]
+    if periodo_desde:
+        ep = ep[ep['periodo'] >= periodo_desde]
+    if periodo_hasta:
+        ep = ep[ep['periodo'] <= periodo_hasta]
+    if contrato:
+        mask = ep['codigo_ctt'].str.contains(contrato, case=False, na=False)
+        if 'Descripcion_ctt' in ep.columns:
+            mask = mask | ep['Descripcion_ctt'].str.contains(contrato, case=False, na=False)
+        ep = ep[mask]
+    return ep
+
+
+def ep_kpis(
+    area: str = '',
+    tipo: str = '',
+    contrato: str = '',
+    estado_ctt: str = '',
+    proyecto: str = '',
+    periodo_desde: str = '',
+    periodo_hasta: str = '',
+) -> dict:
+    df = _ep_base(area, tipo, contrato, estado_ctt, proyecto, periodo_desde, periodo_hasta)
+    return {
+        'ep_total_clp':        float(df['monto_CLP'].sum()),
+        'num_eps':             int(len(df)),
+        'contratos_con_ep':    int(df['codigo_ctt'].nunique()),
+        'ep_promedio_contrato': float(df['monto_CLP'].sum() / max(df['codigo_ctt'].nunique(), 1)),
+    }
+
+
+def ep_filtros() -> dict:
+    ep = load_ep().copy()
+    if 'Fecha_Periodo' in ep.columns:
+        ep['periodo'] = ep['Fecha_Periodo'].dt.strftime('%Y-%m')
+        periodos = sorted(ep['periodo'].dropna().unique().tolist())
+    else:
+        periodos = []
+    proj_col = next((c for c in ep.columns if c.lower() == 'proyecto'), None)
+    proyectos = sorted(
+        ep[proj_col].replace('', float('nan')).dropna().unique().tolist()
+    ) if proj_col else []
+    return {
+        'areas':       sorted(ep['Area_contrato'].dropna().unique().tolist()) if 'Area_contrato' in ep.columns else [],
+        'tipos':       sorted(ep['Tipo_contrato'].dropna().unique().tolist()) if 'Tipo_contrato' in ep.columns else [],
+        'estados_ctt': sorted(ep['Estado_ctt'].replace('', float('nan')).dropna().unique().tolist()) if 'Estado_ctt' in ep.columns else [],
+        'proyectos':   proyectos,
+        'periodos':    periodos,
+    }
+
+
+def ep_tabla(
+    area: str = '',
+    tipo: str = '',
+    contrato: str = '',
+    estado_ctt: str = '',
+    proyecto: str = '',
+    periodo_desde: str = '',
+    periodo_hasta: str = '',
+) -> list[dict]:
+    df = _ep_base(area, tipo, contrato, estado_ctt, proyecto, periodo_desde, periodo_hasta)
+    if df.empty:
+        return []
+
+    agg: dict = {'ep_total': ('monto_CLP', 'sum'), 'num_eps': ('monto_CLP', 'count')}
+    if 'periodo' in df.columns:
+        agg['primer_periodo'] = ('periodo', 'min')
+        agg['ultimo_periodo'] = ('periodo', 'max')
+
+    grp = df.groupby('codigo_ctt').agg(**{k: v for k, v in agg.items()}).reset_index()
+
+    attrs_cols = [c for c in ['Descripcion_ctt', 'Tipo_contrato', 'Area_contrato', 'Estado_ctt'] if c in df.columns]
+    if attrs_cols:
+        attrs = df[['codigo_ctt'] + attrs_cols].drop_duplicates('codigo_ctt')
+        grp = grp.merge(attrs, on='codigo_ctt', how='left')
+
+    grp = grp.sort_values('ep_total', ascending=False)
+    return grp.fillna('').to_dict('records')
+
+
+def ep_por_mes(
+    area: str = '',
+    tipo: str = '',
+    contrato: str = '',
+    estado_ctt: str = '',
+    proyecto: str = '',
+    periodo_desde: str = '',
+    periodo_hasta: str = '',
+) -> list[dict]:
+    df = _ep_base(area, tipo, contrato, estado_ctt, proyecto, periodo_desde, periodo_hasta)
+    if df.empty or 'periodo' not in df.columns:
+        return []
+    grp = df.groupby('periodo')['monto_CLP'].sum().reset_index()
+    grp.columns = ['periodo', 'ep_mes']
+    return grp.sort_values('periodo').to_dict('records')
+
+
+def ep_por_tipo(
+    area: str = '',
+    contrato: str = '',
+    estado_ctt: str = '',
+    proyecto: str = '',
+    periodo_desde: str = '',
+    periodo_hasta: str = '',
+) -> list[dict]:
+    df = _ep_base(area, '', contrato, estado_ctt, proyecto, periodo_desde, periodo_hasta)
+    if df.empty or 'Tipo_contrato' not in df.columns:
+        return []
+    grp = df.groupby('Tipo_contrato')['monto_CLP'].sum().reset_index()
+    grp.columns = ['tipo', 'monto']
+    return grp.sort_values('monto', ascending=False).to_dict('records')
+
+
+def ep_timeline(
+    area: str = '',
+    tipo: str = '',
+    contrato: str = '',
+    estado_ctt: str = '',
+    proyecto: str = '',
+    periodo_desde: str = '',
+    periodo_hasta: str = '',
+    limite: int = 60,
+) -> dict:
+    """
+    Matriz de EP por contrato × mes.
+    Columnas fijas: contrato, descripcion, area, tipo, total_ep, num_eps.
+    Columnas de meses: EP consumido en ese mes (0 si no hubo).
+    """
+    df = _ep_base(area, tipo, contrato, estado_ctt, proyecto, periodo_desde, periodo_hasta)
+    mes_actual = pd.Timestamp.now().strftime('%Y-%m')
+
+    if df.empty or 'periodo' not in df.columns:
+        return {'meses': [], 'mes_actual': mes_actual, 'contratos': [], 'total_contratos': 0}
+
+    meses: list[str] = sorted(df['periodo'].dropna().unique().tolist())
+
+    # EP por (contrato, periodo)
+    ep_mx = df.groupby(['codigo_ctt', 'periodo'])['monto_CLP'].sum()
+
+    # Agregado por contrato
+    ctts_grp = (
+        df.groupby('codigo_ctt')
+        .agg(total_ep=('monto_CLP', 'sum'), num_eps=('monto_CLP', 'count'))
+        .reset_index()
+        .sort_values('total_ep', ascending=False)
+        .head(limite)
+    )
+
+    attrs_cols = [c for c in ['Descripcion_ctt', 'Tipo_contrato', 'Area_contrato', 'Estado_ctt'] if c in df.columns]
+    if attrs_cols:
+        attrs = df[['codigo_ctt'] + attrs_cols].drop_duplicates('codigo_ctt')
+        ctts_grp = ctts_grp.merge(attrs, on='codigo_ctt', how='left')
+
+    total = int(df['codigo_ctt'].nunique())
+    result = []
+    for _, row in ctts_grp.iterrows():
+        ctt = str(row['codigo_ctt'])
+        eps = [round(float(ep_mx.get((ctt, m), 0) or 0)) for m in meses]
+        result.append({
+            'codigo_ctt':  ctt,
+            'descripcion': str(row.get('Descripcion_ctt', '') or ''),
+            'area':        str(row.get('Area_contrato',   '') or ''),
+            'tipo':        str(row.get('Tipo_contrato',   '') or ''),
+            'estado_ctt':  str(row.get('Estado_ctt',      '') or ''),
+            'total_ep':    round(float(row['total_ep'])),
+            'num_eps':     int(row['num_eps']),
+            'eps':         eps,
+        })
+
+    return {
+        'meses':            meses,
+        'mes_actual':       mes_actual,
+        'contratos':        result,
+        'total_contratos':  total,
+    }
 
 
 def alertas_boletas(estado_ctt: str = '', area: str = '', tipo: str = '', proyecto: str = '', contrato: str = '', campana: str = '') -> list[dict]:

@@ -51,3 +51,8 @@ def get_cobertura_metros():
     return get_sourcing_cobertura_metros()
 
 
+@router.get("/cobertura-detalle")
+def get_cobertura_detalle(mes: str, cubierto: int = 1):
+    _check()
+    from app.data.sql_server import get_sourcing_cobertura_detalle
+    return get_sourcing_cobertura_detalle(mes, bool(cubierto))

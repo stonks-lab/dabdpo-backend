@@ -244,6 +244,131 @@ def get_sourcing_cobertura_metros() -> list[dict]:
     return sorted(result.values(), key=lambda x: x['mes'])
 
 
+def get_sourcing_cobertura_detalle(mes: str, cubierto: bool) -> dict:
+    """
+    Para un mes y tipo (cubierto/no_cubierto) devuelve:
+    - por_proyecto: metros PAI agrupados por proyecto (para gráfico)
+    - detalle: contratos de sourcing_plan para esos id_blancos
+    """
+    # 1. Cobertura por id_blanco
+    sp = query_df("""
+        SELECT id_blanco, ISNULL(alcance, '') AS alcance,
+               MAX(CASE WHEN ISNULL(contrato, '') != '' THEN 1 ELSE 0 END) AS tiene_contrato
+        FROM dbo.sourcing_plan
+        WHERE id_blanco IS NOT NULL AND id_blanco != ''
+        GROUP BY id_blanco, ISNULL(alcance, '')
+    """)
+    if sp.empty:
+        return {"por_proyecto": [], "detalle": []}
+
+    coverage = sp.groupby('id_blanco')['tiene_contrato'].min()
+    covered_ids = set(coverage[coverage == 1].index.astype(str).tolist())
+
+    # 2. PAI_Proyectos — versión más reciente, filtrado al mes
+    try:
+        pai = query_df_bi("SELECT * FROM dbo.PAI_Proyectos")
+    except Exception:
+        pai = pd.DataFrame()
+
+    id_blancos_filtrados: list[str] = []
+    por_proyecto: list[dict] = []
+
+    if not pai.empty:
+        pai.columns = [_normalize_col(c) for c in pai.columns]
+        ano_col = next((c for c in pai.columns if c in ('ano_pai', 'año_pai', 'anio_pai')), None)
+        ver_col = next((c for c in pai.columns if 'version' in c.lower()), None)
+        fc_col  = next((c for c in pai.columns if 'fecha_carga' in c), None)
+        if ano_col and ver_col:
+            latest_ver = pai.groupby(ano_col)[ver_col].max().reset_index(name='_max_ver')
+            pai = pai.merge(latest_ver, on=ano_col)
+            pai = pai[pai[ver_col] == pai['_max_ver']].drop(columns='_max_ver').copy()
+        elif fc_col:
+            latest_date = str(pai[fc_col].max())[:10]
+            pai = pai[pai[fc_col].astype(str).str[:10] == latest_date].copy()
+
+        id_col    = 'id_blanco' if 'id_blanco' in pai.columns else next((c for c in pai.columns if 'blanco' in c.lower()), None)
+        metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'pai' in c.lower()), None) or \
+                    next((c for c in pai.columns if 'metro' in c.lower()), None)
+
+        if id_col and metro_col and 'mes' in pai.columns:
+            _bad = {'', 'none', 'nan'}
+            pai = pai[pai[id_col].notna() & ~pai[id_col].astype(str).str.strip().str.lower().isin(_bad)].copy()
+            parsed = pd.to_datetime(pai['mes'], format='%Y-%m-%d', errors='coerce')
+            pai['_mes'] = parsed.dt.strftime('%Y-%m').where(parsed.notna(), None)
+            pai = pai[pai['_mes'] == mes].copy()
+            pai[metro_col] = pd.to_numeric(pai[metro_col], errors='coerce').fillna(0)
+            pai['_cubierto'] = pai[id_col].astype(str).isin(covered_ids)
+            pai_f = pai[pai['_cubierto'] == cubierto].copy()
+
+            id_blancos_filtrados = list(pai_f[id_col].astype(str).unique())
+
+            # Nombre del proyecto: desde sourcing_plan
+            nombre_sp = query_df("""
+                SELECT id_blanco, MAX(proyecto) AS proyecto
+                FROM dbo.sourcing_plan
+                WHERE id_blanco IS NOT NULL AND id_blanco != ''
+                GROUP BY id_blanco
+            """)
+            nombre_map = nombre_sp.set_index('id_blanco')['proyecto'].to_dict() if not nombre_sp.empty else {}
+
+            grp = pai_f.groupby(id_col)[metro_col].sum().reset_index()
+            grp.columns = ['id_blanco', 'metros']
+            grp['id_blanco'] = grp['id_blanco'].astype(str)
+            grp['proyecto'] = grp['id_blanco'].map(lambda x: nombre_map.get(x, x))
+            grp['metros']   = grp['metros'].round(1)
+
+            por_proyecto = (
+                grp.groupby('proyecto')['metros'].sum()
+                .reset_index()
+                .sort_values('metros', ascending=False)
+                .to_dict('records')
+            )
+
+    # Fallback sin PAI: usar los id_blancos de sourcing_plan según cobertura
+    if not id_blancos_filtrados:
+        if cubierto:
+            id_blancos_filtrados = list(covered_ids)
+        else:
+            all_ids = set(sp['id_blanco'].astype(str).unique())
+            id_blancos_filtrados = list(all_ids - covered_ids)
+
+    if not id_blancos_filtrados:
+        return {"por_proyecto": por_proyecto, "detalle": []}
+
+    # 3. Detalle de contratos desde sourcing_plan para esos id_blancos
+    placeholders = ','.join(['?' * len(id_blancos_filtrados)])
+    placeholders = ','.join(['?' for _ in id_blancos_filtrados])
+    detalle_df = query_df(f"""
+        SELECT
+            MAX(proyecto)      AS proyecto,
+            id_blanco,
+            MAX(alcance)       AS alcance,
+            contrato,
+            MAX(lic)           AS lic,
+            MIN(inicio)        AS inicio,
+            MAX(termino)       AS termino,
+            SUM(cantidad_plan) AS metros_plan,
+            CASE
+                WHEN ISNULL(contrato, '') != '' THEN 'Con contrato'
+                WHEN ISNULL(MAX(lic), '')   != '' THEN 'En licitación'
+                ELSE 'Sin contrato ni licitación'
+            END AS estado_contrato
+        FROM dbo.sourcing_plan
+        WHERE id_blanco IN ({placeholders})
+        GROUP BY id_blanco, contrato
+        ORDER BY MAX(proyecto), id_blanco, contrato
+    """, params=tuple(id_blancos_filtrados))
+
+    for col in ('inicio', 'termino'):
+        if col in detalle_df.columns:
+            detalle_df[col] = detalle_df[col].astype(str).replace('NaT', '').replace('None', '')
+
+    return {
+        "por_proyecto": por_proyecto,
+        "detalle": detalle_df.fillna('').to_dict('records'),
+    }
+
+
 def get_sourcing_kpis() -> dict:
     sql = """
         SELECT
@@ -305,19 +430,26 @@ def get_sourcing_por_proyecto() -> list[dict]:
 def get_sourcing_tabla() -> list[dict]:
     sql = """
         SELECT
-            MAX(estatus)    AS estatus,
-            MAX(proyecto)   AS proyecto,
-            MAX(id_blanco)  AS id_blanco,
+            MAX(estatus)       AS estatus,
+            proyecto,
+            id_blanco,
             contrato,
-            MAX(empresa)    AS empresa,
-            MAX(tipo)       AS tipo,
-            MIN(inicio)     AS inicio,
-            MAX(termino)    AS termino,
-            MAX(alcance)    AS alcance,
-            SUM(cantidad_plan) AS cantidad_total_plan
+            MAX(empresa)       AS empresa,
+            MAX(lic)           AS lic,
+            MAX(tipo)          AS tipo,
+            MIN(inicio)        AS inicio,
+            MAX(termino)       AS termino,
+            alcance,
+            SUM(cantidad_plan) AS cantidad_total_plan,
+            CASE
+                WHEN ISNULL(contrato, '') != '' THEN 'Con contrato'
+                WHEN ISNULL(MAX(lic), '')  != '' THEN 'En licitación'
+                ELSE 'Sin contrato ni licitación'
+            END AS estado_contrato
         FROM dbo.sourcing_plan
-        GROUP BY contrato
-        ORDER BY MAX(proyecto), contrato
+        GROUP BY proyecto, id_blanco, alcance, contrato
+        ORDER BY proyecto, id_blanco, contrato
+        -- v2
     """
     df = query_df(sql)
     for col in ("inicio", "termino"):
