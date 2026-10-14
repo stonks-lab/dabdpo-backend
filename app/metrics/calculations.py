@@ -399,6 +399,101 @@ def saldo_timeline(
     }
 
 
+def saldo_timeline_por_proyecto(
+    tipo_proyeccion: str = '',
+    meses_hist: int = 12,
+    meses_fut: int = 18,
+) -> dict:
+    """
+    Matriz de saldo mínimo por proyecto × mes.
+    Para cada proyecto, el valor de cada mes es el mínimo saldo entre todos los
+    contratos que lo abastecen. Rojo cuando alguno se agota (saldo ≤ 0).
+    """
+    tl = saldo_timeline(
+        tipo_proyeccion=tipo_proyeccion,
+        meses_hist=meses_hist,
+        meses_fut=meses_fut,
+        limite=999,
+    )
+
+    meses      = tl['meses']
+    mes_actual = tl['mes_actual']
+
+    if not tl['contratos']:
+        return {
+            'meses': meses, 'mes_actual': mes_actual,
+            'mes_actual_idx': tl['mes_actual_idx'],
+            'proyectos': [], 'tiene_proyecciones': tl['tiene_proyecciones'],
+        }
+
+    # Mapeo proyecto → contratos desde EP (fuente principal)
+    ep       = load_ep()
+    proj_col = next((c for c in ep.columns if c.lower() == 'proyecto'), None)
+    proy_ctts: dict[str, set[str]] = {}
+    if proj_col:
+        for proy_val, grp in ep.dropna(subset=[proj_col]).groupby(proj_col):
+            p = str(proy_val).strip()
+            if p and p not in ('nan', 'None', ''):
+                for ctt in grp['codigo_ctt'].astype(str).str.strip():
+                    if ctt:
+                        proy_ctts.setdefault(p, set()).add(ctt)
+
+    # Complementar con proyectos desde proyecciones P&C (campo 'proyectos' en timeline)
+    for ctt_data in tl['contratos']:
+        for p in (x.strip() for x in (ctt_data.get('proyectos') or '').split(',') if x.strip()):
+            proy_ctts.setdefault(p, set()).add(ctt_data['codigo_ctt'])
+
+    ctt_map = {c['codigo_ctt']: c for c in tl['contratos']}
+    n_meses = len(meses)
+
+    result = []
+    for proy in sorted(proy_ctts.keys()):
+        matching = [ctt_map[c] for c in proy_ctts[proy] if c in ctt_map]
+        if not matching:
+            continue
+
+        saldos_min = [
+            min(c['saldos'][i] for c in matching)
+            for i in range(n_meses)
+        ]
+
+        # Agotamiento del proyecto = mínima fecha de agotamiento entre sus contratos
+        agots = [c['mes_agotamiento'] for c in matching if c['mes_agotamiento']]
+        mes_agot = min(agots) if agots else None
+
+        # Cuello de botella: contrato que agota primero
+        contrato_critico = None
+        if mes_agot:
+            criticos = sorted(
+                [c for c in matching if c['mes_agotamiento']],
+                key=lambda c: c['mes_agotamiento'],
+            )
+            contrato_critico = criticos[0]['codigo_ctt']
+
+        result.append({
+            'proyecto':         proy,
+            'n_contratos':      len(matching),
+            'contratos':        [c['codigo_ctt'] for c in matching],
+            'saldos_min':       saldos_min,
+            'mes_agotamiento':  mes_agot,
+            'contrato_critico': contrato_critico,
+        })
+
+    result.sort(key=lambda r: (
+        0 if r['mes_agotamiento'] else 1,
+        r['mes_agotamiento'] or '',
+        r['proyecto'],
+    ))
+
+    return {
+        'meses':              meses,
+        'mes_actual':         mes_actual,
+        'mes_actual_idx':     tl['mes_actual_idx'],
+        'proyectos':          result,
+        'tiene_proyecciones': tl['tiene_proyecciones'],
+    }
+
+
 def saldo_evolucion() -> list[dict]:
     """Retorna EP consumido acumulado mes a mes."""
     ep = load_ep()
@@ -568,7 +663,7 @@ def _filter_ep_fechas(ep: pd.DataFrame, desde: str, hasta: str) -> pd.DataFrame:
     return ep
 
 
-def ep_por_mes(estado_ctt: str = '', area: str = '', tipo: str = '', desde: str = '', hasta: str = '', proyecto: str = '', contrato: str = '', campana: str = '') -> dict:
+def home_ep_por_mes(estado_ctt: str = '', area: str = '', tipo: str = '', desde: str = '', hasta: str = '', proyecto: str = '', contrato: str = '', campana: str = '') -> dict:
     ep   = load_ep()
     ctts = _filter_ctts(estado_ctt, area, tipo, proyecto, contrato, campana)
     if ctts is not None:

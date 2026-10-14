@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query
 from typing import Optional
-from app.metrics.calculations import home_kpis, home_filtros, ep_por_mes, ep_por_tipo_contrato
+from app.metrics.calculations import home_kpis, home_filtros, home_ep_por_mes, ep_por_tipo_contrato
 
 router = APIRouter(prefix="/home", tags=["home"])
 
@@ -35,7 +35,7 @@ def get_ep_por_mes(
     contrato:   Optional[str] = Query(None),
     campana:    Optional[str] = Query(None),
 ):
-    return ep_por_mes(estado_ctt or '', area or '', tipo or '', desde or '', hasta or '', proyecto or '', contrato or '', campana or '')
+    return home_ep_por_mes(estado_ctt or '', area or '', tipo or '', desde or '', hasta or '', proyecto or '', contrato or '', campana or '')
 
 
 @router.get("/ep-por-tipo")

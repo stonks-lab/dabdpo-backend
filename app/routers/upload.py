@@ -28,24 +28,6 @@ async def upload_proyecciones_pyc(file: UploadFile = File(...), usuario: str = "
     return result
 
 
-@router.post("/proyecciones-adc")
-async def upload_proyecciones_adc(file: UploadFile = File(...), usuario: str = ""):
-    if not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):
-        raise HTTPException(status_code=400, detail="Solo se aceptan archivos .xlsx o .xls")
-
-    content = await file.read()
-    try:
-        from app.data.sql_server import load_proyecciones_adc, log_carga
-        result = load_proyecciones_adc(content)
-        log_carga("dbo.proyecciones", "Plataforma", file.filename, usuario or None)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al cargar en SQL Server: {e}")
-
-    return result
-
-
 @router.post("/dimensiones")
 async def upload_dimensiones(file: UploadFile = File(...), usuario: str = ""):
     if not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):
@@ -139,13 +121,16 @@ def _parse_costo_metro(content: bytes, filename: str) -> list[dict]:
                 return i
         return min(default, len(df.columns) - 1)
 
-    camp_col_idx = _find_col(['camp'],                       default=0)
-    col_cmp      = _find_col(['costo', 'program'],            default=_COL_CMP)
-    col_pond     = _find_col(['ponderador'],                  default=_COL_POND)
-    col_cma      = _find_col(['ajustado'], exclude=['desv'],  default=_COL_CMA)
-    col_desv     = _find_col(['desv'],                        default=_COL_DESV)
+    camp_col_idx  = _find_col(['camp'],                       default=0)
+    col_cmp       = _find_col(['costo', 'program'],            default=_COL_CMP)
+    col_pond      = _find_col(['ponderador'],                  default=_COL_POND)
+    col_cma       = _find_col(['ajustado'], exclude=['desv'],  default=_COL_CMA)
+    col_desv      = _find_col(['desv', 'ajust'],               default=_COL_DESV)
+    # Ponderador Perforación Real — columna específica para brecha ajustada
+    col_pond_real = _find_col(['ponderador', 'real'],          default=col_pond)
 
-    pond_series = pd.to_numeric(df.iloc[:, col_pond], errors="coerce").fillna(0)
+    pond_series      = pd.to_numeric(df.iloc[:, col_pond],      errors="coerce").fillna(0)
+    pond_real_series = pd.to_numeric(df.iloc[:, col_pond_real], errors="coerce").fillna(0)
 
     def _wavg(col_idx: int, row_mask) -> float:
         """Promedio ponderado — equivale al valor directo si hay una sola fila por campaña."""
@@ -161,9 +146,10 @@ def _parse_costo_metro(content: bytes, filename: str) -> list[dict]:
         return float((vals[row_mask] * pond_series[row_mask]).sum())
 
     camp_series = df.iloc[:, camp_col_idx].fillna('').astype(str).str.strip()
+    _CAMP_EXCLUIR = {'nan', '', 'total', 'totales', 'total general', 'grand total', 'suma', 'resumen'}
     unique_camps = [
         c for c in camp_series[pond_series > 0].unique()
-        if c and c.lower() not in ('nan', '')
+        if _norm(c) not in _CAMP_EXCLUIR and not _norm(c).startswith('total')
     ]
 
     results: list[dict] = []
@@ -178,15 +164,17 @@ def _parse_costo_metro(content: bytes, filename: str) -> list[dict]:
             brecha    =_wavg(col_desv, mask),
         ))
 
-    # TOTAL: suma ponderada × ponderador
-    total_mask = pond_series > 0
+    # TOTAL: solo filas de campañas válidas (excluye filas de totales del Excel con camp=NaN)
+    total_mask = camp_series.isin(unique_camps) & (pond_series > 0)
+    desv_vals  = pd.to_numeric(df.iloc[:, col_desv], errors='coerce').fillna(0)
+    brecha_total = float((desv_vals[total_mask] * pond_real_series[total_mask]).sum())
     results.append(dict(
         anio=anio, mes=mes, mes_nombre=mes_nombre.capitalize(),
         campana='TOTAL',
         programado=_wsum(col_cmp,  total_mask),
         real      =_wsum(col_cma,  total_mask),
         ajustado  =_wsum(col_cma,  total_mask),
-        brecha    =_wsum(col_desv, total_mask),
+        brecha    =brecha_total,
     ))
 
     return results

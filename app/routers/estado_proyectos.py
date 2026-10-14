@@ -5,6 +5,20 @@ import pandas as pd
 router = APIRouter(prefix="/estado-proyectos", tags=["estado-proyectos"])
 
 
+@router.get("/saldo-timeline")
+def get_saldo_timeline(
+    tipo_proyeccion: Optional[str] = Query(None),
+    meses_hist: int = Query(12),
+    meses_fut:  int = Query(18),
+):
+    from app.metrics.calculations import saldo_timeline_por_proyecto
+    return saldo_timeline_por_proyecto(
+        tipo_proyeccion=tipo_proyeccion or '',
+        meses_hist=meses_hist,
+        meses_fut=meses_fut,
+    )
+
+
 @router.get("/incidencias")
 def get_incidencias():
     from app.data.sql_server import get_incidencias
