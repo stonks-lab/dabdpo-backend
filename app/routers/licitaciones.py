@@ -1,4 +1,6 @@
+import re
 import time
+import unicodedata
 import httpx
 from datetime import datetime
 from fastapi import APIRouter, Query
@@ -97,6 +99,86 @@ def _days_between(start: str | None, end: str | None) -> float | None:
         return None
 
 
+# ── Tipo Servicio (similitud de tokens contra dbo.sourcing_plan.tipo) ────────
+
+_RE_PROCESO_PREFIX = re.compile(r'^CO-\S+\s*', re.IGNORECASE)
+_STOP_ES = {'de', 'la', 'el', 'los', 'las', 'en', 'y', 'o', 'a', 'del', 'con', 'para',
+             'por', 'un', 'una', 'se', 'al', 'e', 'u', 'su', 'que', 'no', 'si'}
+
+def _norm_text(s: str) -> str:
+    nfkd = unicodedata.normalize('NFD', s.lower())
+    ascii_str = ''.join(c for c in nfkd if unicodedata.category(c) != 'Mn')
+    return re.sub(r'[^a-z0-9]+', ' ', ascii_str).strip()
+
+def _tokens(s: str) -> set[str]:
+    return {t for t in _norm_text(s).split() if t not in _STOP_ES and len(t) > 1}
+
+_SOURCING_TIPOS_CACHE: dict = {}
+
+def _get_sourcing_tipos() -> list[str]:
+    now = time.time()
+    if _SOURCING_TIPOS_CACHE.get('ts', 0) + 3600 > now and _SOURCING_TIPOS_CACHE.get('data'):
+        return _SOURCING_TIPOS_CACHE['data']
+    try:
+        from app.data.sql_server import query_df
+        df = query_df("SELECT DISTINCT alcance FROM dbo.sourcing_plan WHERE alcance IS NOT NULL AND LTRIM(RTRIM(alcance)) != ''")
+        tipos = sorted({str(r).strip() for r in df['alcance'] if r and str(r).strip()})
+        _SOURCING_TIPOS_CACHE.update({'ts': now, 'data': tipos})
+        return tipos
+    except Exception:
+        return _SOURCING_TIPOS_CACHE.get('data', [])
+
+def _tipo_servicio(nombre: str) -> str:
+    tipos = _get_sourcing_tipos()
+    if not tipos:
+        return 'Sin clasificar'
+    nombre_limpio = _RE_PROCESO_PREFIX.sub('', nombre)
+    name_tok = _tokens(nombre_limpio)
+    if not name_tok:
+        return 'Sin clasificar'
+    best, best_score = '', 0.0
+    for tipo in tipos:
+        tipo_tok = _tokens(tipo)
+        if not tipo_tok:
+            continue
+        overlap = len(tipo_tok & name_tok)
+        if overlap == 0:
+            continue
+        score = overlap / len(tipo_tok)
+        if score > best_score or (score == best_score and len(tipo_tok) > len(_tokens(best))):
+            best_score, best = score, tipo
+    return best if best_score >= 0.5 else 'Sin clasificar'
+
+
+# ── Fin estimado por Tipo Servicio ────────────────────────────────────────────
+
+def _add_fin_estimado(procesos: list[dict]) -> None:
+    """Agrega fin_estimado a procesos no finalizados basado en ciclo promedio de finalizados del mismo tipo."""
+    from datetime import timedelta
+    ciclos: dict[str, list[float]] = {}
+    for p in procesos:
+        if p.get('Etapa Actual') == 'Finalizado' and p.get('Ciclo real') is not None:
+            ts = p.get('Tipo Servicio', '')
+            if ts and ts != 'Sin clasificar':
+                ciclos.setdefault(ts, []).append(float(p['Ciclo real']))
+    avgs = {ts: sum(v) / len(v) for ts, v in ciclos.items() if v}
+
+    for p in procesos:
+        p['fin_estimado'] = None
+        if p.get('Etapa Actual') == 'Finalizado':
+            continue
+        ts  = p.get('Tipo Servicio', '')
+        avg = avgs.get(ts)
+        inicio = p.get('Fecha inicio real') or p.get('Fecha inicio programado')
+        if avg and inicio:
+            try:
+                p['fin_estimado'] = (
+                    datetime.fromisoformat(str(inicio)) + timedelta(days=round(avg))
+                ).strftime('%Y-%m-%d')
+            except Exception:
+                pass
+
+
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def _load_procesos() -> list[dict]:
@@ -121,6 +203,7 @@ def _load_procesos() -> list[dict]:
             "Avance Gral Proceso":              cv.get("color7__1", ""),
             "Etapa Actual":                     cv.get("estado_16", ""),
             "Tipo Proceso":                     cv.get("label9__1", ""),
+            "Tipo Servicio":                    _tipo_servicio(item["name"]),
             "Estado Inicio-Fin":                cv.get("estado__1", ""),
             "Estado Adjudicación":              cv.get("estado0__1", ""),
             "Fecha Inicio Servicio (Estimada)": cv.get("date_mkwpvwmh") or None,
@@ -136,6 +219,7 @@ def _load_procesos() -> list[dict]:
             "Año":                              cv.get("text_mkrv1410", ""),
             "grupo":                            item.get("group", {}).get("title", ""),
         })
+    _add_fin_estimado(result)
     return result
 
 
@@ -151,7 +235,10 @@ def _load_detalles(proceso: str) -> list[dict]:
         ini_prog, fin_prog = _parse_timeline(cv.get("timerange__1", ""))
         ini_real, fin_real = _parse_timeline(cv.get("real_real__1", ""))
 
-        ciclo_prog = cv.get("n_meros__1", "")
+        ciclo_prog_str = cv.get("n_meros__1", "")
+        ciclo_prog_val = float(ciclo_prog_str) if ciclo_prog_str else None
+        ciclo_real_val = _days_between(ini_real, fin_real)
+        delta_sub = round(ciclo_real_val - ciclo_prog_val) if (ciclo_real_val is not None and ciclo_prog_val is not None) else None
 
         result.append({
             "Subelemento":            cv.get("etapa__1", "") or item["name"],
@@ -160,8 +247,9 @@ def _load_detalles(proceso: str) -> list[dict]:
             "Fecha Fin Acta Inicio":  fin_prog,
             "Inicio real":            ini_real,
             "Fin real":               fin_real,
-            "Ciclo programado":       float(ciclo_prog) if ciclo_prog else None,
-            "Ciclo real":             _days_between(ini_real, fin_real),
+            "Ciclo programado":       ciclo_prog_val,
+            "Ciclo real":             ciclo_real_val,
+            "delta_sub":              delta_sub,
             "Área Responsable":       cv.get("color_mkxwnv9b", "") or cv.get("text_mkxwnv9b", "") or cv.get("dropdown_mkxwnv9b", ""),
             "Estado_Inicio-Fin":      cv.get("prueba_estado__1", "") or cv.get("estado__1", ""),
             "Avance Etapas":          cv.get("prueba_avance__1", ""),
@@ -171,6 +259,38 @@ def _load_detalles(proceso: str) -> list[dict]:
 
 
 # ── Endpoints: Procesos de Licitación (Monday) ────────────────────────────────
+
+@router.get("/procesos/subelementos")
+def get_all_subelementos():
+    """Todos los subelementos con delta = Ciclo Real - Ciclo Prog."""
+    raw = _fetch_board_items(MONDAY_PROCESOS_SUB_BOARD_ID)
+    result = []
+    for item in raw:
+        cv = {c["id"]: (c.get("text") or "") for c in item["column_values"]}
+        n_proceso = cv.get("n__proceso__1", "").strip()
+        if not n_proceso:
+            continue
+        ini_prog, fin_prog = _parse_timeline(cv.get("timerange__1", ""))
+        ini_real, fin_real = _parse_timeline(cv.get("real_real__1", ""))
+        ciclo_prog_str = cv.get("n_meros__1", "")
+        ciclo_prog = float(ciclo_prog_str) if ciclo_prog_str else None
+        ciclo_real = _days_between(ini_real, fin_real)
+        delta_sub = round(ciclo_real - ciclo_prog) if (ciclo_real is not None and ciclo_prog is not None) else None
+        result.append({
+            "Subelemento":        cv.get("etapa__1", "") or item["name"],
+            "N°PROCESO":          n_proceso,
+            "Fecha Inicio Prog":  ini_prog,
+            "Fecha Fin Prog":     fin_prog,
+            "Fecha Inicio Real":  ini_real,
+            "Fecha Fin Real":     fin_real,
+            "Ciclo programado":   ciclo_prog,
+            "Ciclo real":         ciclo_real,
+            "delta_sub":          delta_sub,
+            "Estado_Inicio-Fin":  cv.get("prueba_estado__1", "") or cv.get("estado__1", ""),
+            "Área Responsable":   cv.get("color_mkxwnv9b", "") or cv.get("text_mkxwnv9b", "") or cv.get("dropdown_mkxwnv9b", ""),
+        })
+    return result
+
 
 @router.get("/procesos/kpis")
 def get_procesos_kpis():

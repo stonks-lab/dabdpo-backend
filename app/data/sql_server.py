@@ -50,71 +50,31 @@ def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
 
 # ── Proyecciones ─────────────────────────────────────────────────────────────
 
-def _get_tipo_contrato_map() -> dict[str, str]:
-    """Devuelve {Documento → Tipo_contrato} desde dbo.SIC_Contratos (pos 8 y 21)."""
-    try:
-        df = query_df("SELECT * FROM dbo.SIC_Contratos ORDER BY _fecha_carga DESC")
-    except Exception:
-        return {}
-    if df.empty or len(df.columns) < 22:
-        return {}
-    df = df.rename(columns={df.columns[8]: '_doc', df.columns[21]: '_tipo'})
-    df['_doc'] = df['_doc'].astype(str).str.strip().str.replace('\xa0', '', regex=False)
-    df = df[df['_tipo'].notna() & (df['_tipo'].astype(str).str.strip() != '')]
-    df = df.drop_duplicates(subset='_doc', keep='first')
-    return dict(zip(df['_doc'], df['_tipo'].astype(str)))
-
-
-def _proyecciones_has_monto_usd() -> bool:
-    """Verifica si la columna monto_usd existe en dbo.proyecciones."""
-    try:
-        r = query_df(
-            "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='proyecciones' AND COLUMN_NAME='monto_usd'"
-        )
-        return bool(r.iloc[0]["n"] > 0)
-    except Exception:
-        return False
-
-
 def get_proyecciones(
     contrato: str | None = None,
-    proyecto: str | None = None,
     periodo_desde: str | None = None,
-    periodo_hasta: str | None = None,
     tipo: str | None = None,
 ) -> pd.DataFrame:
     conditions = ["1=1"]
     params: list = []
 
     if contrato:
-        conditions.append("contrato LIKE ?")
-        params.append(f"%{contrato}%")
-    if proyecto:
-        conditions.append("proyecto LIKE ?")
-        params.append(f"%{proyecto}%")
+        conditions.append("contrato = ?")
+        params.append(contrato)
     if periodo_desde:
         conditions.append("periodo >= ?")
         params.append(periodo_desde)
-    if periodo_hasta:
-        conditions.append("periodo <= ?")
-        params.append(periodo_hasta)
     if tipo:
         conditions.append("tipo_proyeccion = ?")
         params.append(tipo)
 
-    where = ' AND '.join(conditions)
-    usd_col = "monto_usd," if _proyecciones_has_monto_usd() else "NULL AS monto_usd,"
     sql = f"""
-        SELECT contrato, proyecto, periodo, monto_proyectado, {usd_col} moneda, tipo_proyeccion, fecha_carga
+        SELECT contrato, proyecto, periodo, monto_proyectado, moneda, tipo_proyeccion, fecha_carga
         FROM dbo.proyecciones
-        WHERE {where}
+        WHERE {' AND '.join(conditions)}
         ORDER BY contrato, periodo, tipo_proyeccion
     """
-    df = query_df(sql, tuple(params))
-    tipo_map = _get_tipo_contrato_map()
-    df['tipo_servicio'] = df['contrato'].str.strip().str.replace('\xa0', '', regex=False).map(tipo_map).fillna('')
-    return df
+    return query_df(sql, tuple(params))
 
 
 def get_proyecciones_vs_ep(periodo_desde: str | None = None) -> pd.DataFrame:
@@ -158,216 +118,6 @@ def get_proyecciones_kpis() -> dict:
 
 
 # ── Sourcing Plan ─────────────────────────────────────────────────────────────
-
-def get_sourcing_cobertura_metros() -> list[dict]:
-    """
-    Devuelve metros cubiertos vs no cubiertos por mes.
-    Cubierto = todos los alcances del id_blanco tienen contrato asignado en sourcing_plan.
-    Metros vienen de dbo.PAI_Proyectos (versión más reciente), columna metros_pai.
-    """
-    # 1. Cobertura por id_blanco
-    sp = query_df("""
-        SELECT id_blanco, ISNULL(alcance, '') AS alcance,
-               MAX(CASE WHEN ISNULL(contrato, '') != '' THEN 1 ELSE 0 END) AS tiene_contrato
-        FROM dbo.sourcing_plan
-        WHERE id_blanco IS NOT NULL AND id_blanco != ''
-        GROUP BY id_blanco, ISNULL(alcance, '')
-    """)
-
-    if sp.empty:
-        return []
-
-    # id_blanco cubierto si TODOS sus alcances tienen contrato
-    coverage = sp.groupby('id_blanco')['tiene_contrato'].min()
-    covered_ids = set(coverage[coverage == 1].index.astype(str).tolist())
-
-    # 2. PAI_Proyectos — versión más reciente
-    try:
-        pai = query_df_bi("SELECT * FROM dbo.PAI_Proyectos")
-    except Exception:
-        return []
-    if pai.empty:
-        return []
-
-    pai.columns = [_normalize_col(c) for c in pai.columns]
-
-    # Filtrar a la última VERSION_PAI por AÑO_PAI (el PAI se carga mes a mes,
-    # así que max(fecha_carga) solo captura el último mes; la versión agrupa todos)
-    ano_col = next((c for c in pai.columns if c in ('ano_pai', 'año_pai', 'anio_pai')), None)
-    ver_col = next((c for c in pai.columns if 'version' in c.lower()), None)
-    fc_col  = next((c for c in pai.columns if 'fecha_carga' in c), None)
-    if ano_col and ver_col:
-        latest_ver = pai.groupby(ano_col)[ver_col].max().reset_index(name='_max_ver')
-        pai = pai.merge(latest_ver, on=ano_col)
-        pai = pai[pai[ver_col] == pai['_max_ver']].drop(columns='_max_ver').copy()
-    elif fc_col:
-        latest_date = str(pai[fc_col].max())[:10]
-        pai = pai[pai[fc_col].astype(str).str[:10] == latest_date].copy()
-
-    # 3. Identificar columnas clave — preferir columna exacta 'id_blanco'
-    id_col = 'id_blanco' if 'id_blanco' in pai.columns else next(
-        (c for c in pai.columns if 'blanco' in c.lower()), None
-    )
-    if not id_col or 'mes' not in pai.columns:
-        return []
-
-    metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'pai' in c.lower()), None)
-    if not metro_col:
-        metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'program' in c.lower()), None)
-    if not metro_col:
-        metro_col = next((c for c in pai.columns if 'metro' in c.lower()), None)
-    if not metro_col:
-        return []
-
-    # 4. Normalizar mes y metros; descartar filas sin id_blanco (incluye None/nan)
-    _bad = {'', 'none', 'nan'}
-    pai = pai[pai[id_col].notna() & ~pai[id_col].astype(str).str.strip().str.lower().isin(_bad)].copy()
-    parsed = pd.to_datetime(pai['mes'], format='%Y-%m-%d', errors='coerce')
-    pai['_mes'] = parsed.dt.strftime('%Y-%m').where(parsed.notna(), None)
-    pai = pai[pai['_mes'].notna()].copy()
-    pai[metro_col] = pd.to_numeric(pai[metro_col], errors='coerce').fillna(0)
-
-    # 5. Marcar cobertura y agregar por mes
-    pai['_cubierto'] = pai[id_col].astype(str).isin(covered_ids)
-    grp = pai.groupby(['_mes', '_cubierto'])[metro_col].sum().reset_index()
-
-    result: dict[str, dict] = {}
-    for _, row in grp.iterrows():
-        mes = str(row['_mes'])
-        if mes not in result:
-            result[mes] = {'mes': mes, 'cubiertos': 0.0, 'no_cubiertos': 0.0}
-        if row['_cubierto']:
-            result[mes]['cubiertos'] = round(float(row[metro_col]), 1)
-        else:
-            result[mes]['no_cubiertos'] = round(float(row[metro_col]), 1)
-
-    return sorted(result.values(), key=lambda x: x['mes'])
-
-
-def get_sourcing_cobertura_detalle(mes: str, cubierto: bool) -> dict:
-    """
-    Para un mes y tipo (cubierto/no_cubierto) devuelve:
-    - por_proyecto: metros PAI agrupados por proyecto (para gráfico)
-    - detalle: contratos de sourcing_plan para esos id_blancos
-    """
-    # 1. Cobertura por id_blanco
-    sp = query_df("""
-        SELECT id_blanco, ISNULL(alcance, '') AS alcance,
-               MAX(CASE WHEN ISNULL(contrato, '') != '' THEN 1 ELSE 0 END) AS tiene_contrato
-        FROM dbo.sourcing_plan
-        WHERE id_blanco IS NOT NULL AND id_blanco != ''
-        GROUP BY id_blanco, ISNULL(alcance, '')
-    """)
-    if sp.empty:
-        return {"por_proyecto": [], "detalle": []}
-
-    coverage = sp.groupby('id_blanco')['tiene_contrato'].min()
-    covered_ids = set(coverage[coverage == 1].index.astype(str).tolist())
-
-    # 2. PAI_Proyectos — versión más reciente, filtrado al mes
-    try:
-        pai = query_df_bi("SELECT * FROM dbo.PAI_Proyectos")
-    except Exception:
-        pai = pd.DataFrame()
-
-    id_blancos_filtrados: list[str] = []
-    por_proyecto: list[dict] = []
-
-    if not pai.empty:
-        pai.columns = [_normalize_col(c) for c in pai.columns]
-        ano_col = next((c for c in pai.columns if c in ('ano_pai', 'año_pai', 'anio_pai')), None)
-        ver_col = next((c for c in pai.columns if 'version' in c.lower()), None)
-        fc_col  = next((c for c in pai.columns if 'fecha_carga' in c), None)
-        if ano_col and ver_col:
-            latest_ver = pai.groupby(ano_col)[ver_col].max().reset_index(name='_max_ver')
-            pai = pai.merge(latest_ver, on=ano_col)
-            pai = pai[pai[ver_col] == pai['_max_ver']].drop(columns='_max_ver').copy()
-        elif fc_col:
-            latest_date = str(pai[fc_col].max())[:10]
-            pai = pai[pai[fc_col].astype(str).str[:10] == latest_date].copy()
-
-        id_col    = 'id_blanco' if 'id_blanco' in pai.columns else next((c for c in pai.columns if 'blanco' in c.lower()), None)
-        metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'pai' in c.lower()), None) or \
-                    next((c for c in pai.columns if 'metro' in c.lower()), None)
-
-        if id_col and metro_col and 'mes' in pai.columns:
-            _bad = {'', 'none', 'nan'}
-            pai = pai[pai[id_col].notna() & ~pai[id_col].astype(str).str.strip().str.lower().isin(_bad)].copy()
-            parsed = pd.to_datetime(pai['mes'], format='%Y-%m-%d', errors='coerce')
-            pai['_mes'] = parsed.dt.strftime('%Y-%m').where(parsed.notna(), None)
-            pai = pai[pai['_mes'] == mes].copy()
-            pai[metro_col] = pd.to_numeric(pai[metro_col], errors='coerce').fillna(0)
-            pai['_cubierto'] = pai[id_col].astype(str).isin(covered_ids)
-            pai_f = pai[pai['_cubierto'] == cubierto].copy()
-
-            id_blancos_filtrados = list(pai_f[id_col].astype(str).unique())
-
-            # Nombre del proyecto: desde sourcing_plan
-            nombre_sp = query_df("""
-                SELECT id_blanco, MAX(proyecto) AS proyecto
-                FROM dbo.sourcing_plan
-                WHERE id_blanco IS NOT NULL AND id_blanco != ''
-                GROUP BY id_blanco
-            """)
-            nombre_map = nombre_sp.set_index('id_blanco')['proyecto'].to_dict() if not nombre_sp.empty else {}
-
-            grp = pai_f.groupby(id_col)[metro_col].sum().reset_index()
-            grp.columns = ['id_blanco', 'metros']
-            grp['id_blanco'] = grp['id_blanco'].astype(str)
-            grp['proyecto'] = grp['id_blanco'].map(lambda x: nombre_map.get(x, x))
-            grp['metros']   = grp['metros'].round(1)
-
-            por_proyecto = (
-                grp.groupby('proyecto')['metros'].sum()
-                .reset_index()
-                .sort_values('metros', ascending=False)
-                .to_dict('records')
-            )
-
-    # Fallback sin PAI: usar los id_blancos de sourcing_plan según cobertura
-    if not id_blancos_filtrados:
-        if cubierto:
-            id_blancos_filtrados = list(covered_ids)
-        else:
-            all_ids = set(sp['id_blanco'].astype(str).unique())
-            id_blancos_filtrados = list(all_ids - covered_ids)
-
-    if not id_blancos_filtrados:
-        return {"por_proyecto": por_proyecto, "detalle": []}
-
-    # 3. Detalle de contratos desde sourcing_plan para esos id_blancos
-    placeholders = ','.join(['?' * len(id_blancos_filtrados)])
-    placeholders = ','.join(['?' for _ in id_blancos_filtrados])
-    detalle_df = query_df(f"""
-        SELECT
-            MAX(proyecto)      AS proyecto,
-            id_blanco,
-            MAX(alcance)       AS alcance,
-            contrato,
-            MAX(lic)           AS lic,
-            MIN(inicio)        AS inicio,
-            MAX(termino)       AS termino,
-            SUM(cantidad_plan) AS metros_plan,
-            CASE
-                WHEN ISNULL(contrato, '') != '' THEN 'Con contrato'
-                WHEN ISNULL(MAX(lic), '')   != '' THEN 'En licitación'
-                ELSE 'Sin contrato ni licitación'
-            END AS estado_contrato
-        FROM dbo.sourcing_plan
-        WHERE id_blanco IN ({placeholders})
-        GROUP BY id_blanco, contrato
-        ORDER BY MAX(proyecto), id_blanco, contrato
-    """, params=tuple(id_blancos_filtrados))
-
-    for col in ('inicio', 'termino'):
-        if col in detalle_df.columns:
-            detalle_df[col] = detalle_df[col].astype(str).replace('NaT', '').replace('None', '')
-
-    return {
-        "por_proyecto": por_proyecto,
-        "detalle": detalle_df.fillna('').to_dict('records'),
-    }
-
 
 def get_sourcing_kpis() -> dict:
     sql = """
@@ -449,13 +199,190 @@ def get_sourcing_tabla() -> list[dict]:
         FROM dbo.sourcing_plan
         GROUP BY proyecto, id_blanco, alcance, contrato
         ORDER BY proyecto, id_blanco, contrato
-        -- v2
     """
     df = query_df(sql)
     for col in ("inicio", "termino"):
         if col in df.columns:
             df[col] = df[col].astype(str).replace("NaT", "").replace("None", "")
     return df.fillna("").to_dict("records")
+
+
+def get_sourcing_cobertura_metros() -> list[dict]:
+    """
+    Devuelve metros cubiertos vs no cubiertos por mes.
+    Cubierto = todos los alcances del id_blanco tienen contrato asignado en sourcing_plan.
+    Metros vienen de dbo.PAI_Proyectos (versión más reciente), columna metros_pai.
+    """
+    sp = query_df("""
+        SELECT id_blanco, ISNULL(alcance, '') AS alcance,
+               MAX(CASE WHEN ISNULL(contrato, '') != '' THEN 1 ELSE 0 END) AS tiene_contrato
+        FROM dbo.sourcing_plan
+        WHERE id_blanco IS NOT NULL AND id_blanco != ''
+        GROUP BY id_blanco, ISNULL(alcance, '')
+    """)
+
+    if sp.empty:
+        return []
+
+    coverage = sp.groupby('id_blanco')['tiene_contrato'].min()
+    covered_ids = set(coverage[coverage == 1].index.astype(str).tolist())
+
+    try:
+        pai = query_df_bi("SELECT * FROM dbo.PAI_Proyectos")
+    except Exception:
+        return []
+    if pai.empty:
+        return []
+
+    pai.columns = [_normalize_col(c) for c in pai.columns]
+
+    pai = _keep_latest_pai(pai)
+
+    id_col = 'id_blanco' if 'id_blanco' in pai.columns else next(
+        (c for c in pai.columns if 'blanco' in c.lower()), None
+    )
+    if not id_col or 'mes' not in pai.columns:
+        return []
+
+    metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'pai' in c.lower()), None)
+    if not metro_col:
+        metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'program' in c.lower()), None)
+    if not metro_col:
+        metro_col = next((c for c in pai.columns if 'metro' in c.lower()), None)
+    if not metro_col:
+        return []
+
+    _bad = {'', 'none', 'nan'}
+    pai = pai[pai[id_col].notna() & ~pai[id_col].astype(str).str.strip().str.lower().isin(_bad)].copy()
+    parsed = pd.to_datetime(pai['mes'], format='%Y-%m-%d', errors='coerce')
+    pai['_mes'] = parsed.dt.strftime('%Y-%m').where(parsed.notna(), None)
+    pai = pai[pai['_mes'].notna()].copy()
+    pai[metro_col] = pd.to_numeric(pai[metro_col], errors='coerce').fillna(0)
+
+    pai['_cubierto'] = pai[id_col].astype(str).isin(covered_ids)
+    grp = pai.groupby(['_mes', '_cubierto'])[metro_col].sum().reset_index()
+
+    result: dict[str, dict] = {}
+    for _, row in grp.iterrows():
+        mes = str(row['_mes'])
+        if mes not in result:
+            result[mes] = {'mes': mes, 'cubiertos': 0.0, 'no_cubiertos': 0.0}
+        if row['_cubierto']:
+            result[mes]['cubiertos'] = round(float(row[metro_col]), 1)
+        else:
+            result[mes]['no_cubiertos'] = round(float(row[metro_col]), 1)
+
+    return sorted(result.values(), key=lambda x: x['mes'])
+
+
+def get_sourcing_cobertura_detalle(mes: str, cubierto: bool) -> dict:
+    """
+    Para un mes y tipo (cubierto/no_cubierto) devuelve:
+    - por_proyecto: metros PAI agrupados por proyecto (para gráfico)
+    - detalle: contratos de sourcing_plan para esos id_blancos
+    """
+    sp = query_df("""
+        SELECT id_blanco, ISNULL(alcance, '') AS alcance,
+               MAX(CASE WHEN ISNULL(contrato, '') != '' THEN 1 ELSE 0 END) AS tiene_contrato
+        FROM dbo.sourcing_plan
+        WHERE id_blanco IS NOT NULL AND id_blanco != ''
+        GROUP BY id_blanco, ISNULL(alcance, '')
+    """)
+    if sp.empty:
+        return {"por_proyecto": [], "detalle": []}
+
+    coverage = sp.groupby('id_blanco')['tiene_contrato'].min()
+    covered_ids = set(coverage[coverage == 1].index.astype(str).tolist())
+
+    try:
+        pai = query_df_bi("SELECT * FROM dbo.PAI_Proyectos")
+    except Exception:
+        pai = pd.DataFrame()
+
+    id_blancos_filtrados: list[str] = []
+    por_proyecto: list[dict] = []
+
+    if not pai.empty:
+        pai.columns = [_normalize_col(c) for c in pai.columns]
+        pai = _keep_latest_pai(pai)
+
+        id_col    = 'id_blanco' if 'id_blanco' in pai.columns else next((c for c in pai.columns if 'blanco' in c.lower()), None)
+        metro_col = next((c for c in pai.columns if 'metro' in c.lower() and 'pai' in c.lower()), None) or \
+                    next((c for c in pai.columns if 'metro' in c.lower()), None)
+
+        if id_col and metro_col and 'mes' in pai.columns:
+            _bad = {'', 'none', 'nan'}
+            pai = pai[pai[id_col].notna() & ~pai[id_col].astype(str).str.strip().str.lower().isin(_bad)].copy()
+            parsed = pd.to_datetime(pai['mes'], format='%Y-%m-%d', errors='coerce')
+            pai['_mes'] = parsed.dt.strftime('%Y-%m').where(parsed.notna(), None)
+            pai = pai[pai['_mes'] == mes].copy()
+            pai[metro_col] = pd.to_numeric(pai[metro_col], errors='coerce').fillna(0)
+            pai['_cubierto'] = pai[id_col].astype(str).isin(covered_ids)
+            pai_f = pai[pai['_cubierto'] == cubierto].copy()
+
+            id_blancos_filtrados = list(pai_f[id_col].astype(str).unique())
+
+            nombre_sp = query_df("""
+                SELECT id_blanco, MAX(proyecto) AS proyecto
+                FROM dbo.sourcing_plan
+                WHERE id_blanco IS NOT NULL AND id_blanco != ''
+                GROUP BY id_blanco
+            """)
+            nombre_map = nombre_sp.set_index('id_blanco')['proyecto'].to_dict() if not nombre_sp.empty else {}
+
+            grp = pai_f.groupby(id_col)[metro_col].sum().reset_index()
+            grp.columns = ['id_blanco', 'metros']
+            grp['id_blanco'] = grp['id_blanco'].astype(str)
+            grp['proyecto'] = grp['id_blanco'].map(lambda x: nombre_map.get(x, x))
+            grp['metros']   = grp['metros'].round(1)
+
+            por_proyecto = (
+                grp.groupby('proyecto')['metros'].sum()
+                .reset_index()
+                .sort_values('metros', ascending=False)
+                .to_dict('records')
+            )
+
+    if not id_blancos_filtrados:
+        if cubierto:
+            id_blancos_filtrados = list(covered_ids)
+        else:
+            all_ids = set(sp['id_blanco'].astype(str).unique())
+            id_blancos_filtrados = list(all_ids - covered_ids)
+
+    if not id_blancos_filtrados:
+        return {"por_proyecto": por_proyecto, "detalle": []}
+
+    placeholders = ','.join(['?' for _ in id_blancos_filtrados])
+    detalle_df = query_df(f"""
+        SELECT
+            MAX(proyecto)      AS proyecto,
+            id_blanco,
+            MAX(alcance)       AS alcance,
+            contrato,
+            MAX(lic)           AS lic,
+            MIN(inicio)        AS inicio,
+            MAX(termino)       AS termino,
+            SUM(cantidad_plan) AS metros_plan,
+            CASE
+                WHEN ISNULL(contrato, '') != '' THEN 'Con contrato'
+                WHEN ISNULL(MAX(lic), '')   != '' THEN 'En licitación'
+                ELSE 'Sin contrato ni licitación'
+            END AS estado_contrato
+        FROM dbo.sourcing_plan
+        WHERE id_blanco IN ({placeholders})
+        GROUP BY id_blanco, contrato
+        ORDER BY MAX(proyecto), id_blanco, contrato
+    """, params=tuple(id_blancos_filtrados))
+
+    for col in ('inicio', 'termino'):
+        if col in detalle_df.columns:
+            detalle_df[col] = detalle_df[col].astype(str).replace('NaT', '').replace('None', '')
+
+    return {
+        "por_proyecto": por_proyecto,
+        "detalle": detalle_df.fillna('').to_dict('records'),
+    }
 
 
 def get_proyecciones_por_mes() -> list[dict]:
@@ -468,114 +395,6 @@ def get_proyecciones_por_mes() -> list[dict]:
         ORDER BY periodo, tipo_proyeccion
     """
     return query_df(sql).fillna(0).to_dict("records")
-
-
-# ── Carga desde Excel AdC (proyecciones de administradores de contratos) ──────
-
-def _transform_adc(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Transforma la hoja PROYECCIONES FIN del Excel AdC.
-    Columnas de fecha contienen montos CLP directamente (no cantidades).
-    """
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    id_cols   = [c for c in ['CODIGO CONTRATO', 'ID_BLANCO', 'MONEDA'] if c in df.columns]
-    date_cols = [
-        c for c in df.columns
-        if c not in id_cols and (
-            hasattr(df[c].dtype, 'tz') or
-            str(df[c].dtype).startswith('datetime') or
-            (isinstance(c, str) and len(c) >= 7 and c[:4].isdigit())
-        )
-    ]
-    # Captura columnas datetime que pandas convierte a objeto con formato fecha
-    import re as _re
-    date_cols = [c for c in df.columns if c not in id_cols and (
-        hasattr(c, 'strftime') or
-        (isinstance(c, str) and _re.match(r'^\d{4}-\d{2}', c))
-    )]
-
-    # Validar columnas mínimas
-    if 'CODIGO CONTRATO' not in df.columns or 'ID_BLANCO' not in df.columns:
-        raise ValueError("El Excel debe tener columnas 'CODIGO CONTRATO' e 'ID_BLANCO'.")
-    if not date_cols:
-        raise ValueError("No se encontraron columnas de fecha (meses) en la hoja PROYECCIONES FIN.")
-
-    df = df[df['CODIGO CONTRATO'].notna() & df['ID_BLANCO'].notna()].copy()
-
-    df_long = df[id_cols + date_cols].melt(
-        id_vars=id_cols, var_name='fecha_col', value_name='monto_proyectado'
-    )
-    df_long['monto_proyectado'] = pd.to_numeric(df_long['monto_proyectado'], errors='coerce').fillna(0)
-    df_long = df_long[df_long['monto_proyectado'] > 0].copy()
-
-    df_long['periodo'] = df_long['fecha_col'].apply(
-        lambda x: x.strftime('%Y-%m') if hasattr(x, 'strftime') else str(x)[:7]
-    )
-    df_long.rename(columns={
-        'CODIGO CONTRATO': 'contrato',
-        'ID_BLANCO':       'proyecto',
-        'MONEDA':          'moneda',
-    }, inplace=True)
-
-    group = [c for c in ['contrato', 'proyecto', 'periodo', 'moneda'] if c in df_long.columns]
-    result = df_long.groupby(group, dropna=False)['monto_proyectado'].sum().reset_index()
-    result['tipo_proyeccion'] = 'AdC'
-    result['monto_usd']       = None
-    result['fecha_carga']     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    return result[result['monto_proyectado'] > 0]
-
-
-def load_proyecciones_adc(excel_bytes: bytes) -> dict:
-    """
-    Carga proyecciones AdC desde la hoja PROYECCIONES FIN del Excel.
-    Por cada (contrato, proyecto) del archivo, reemplaza solo las filas AdC
-    de esa combinación — sin tocar P&C ni los contratos de otros admins.
-    """
-    import io
-    xl = pd.ExcelFile(io.BytesIO(excel_bytes))
-    if 'PROYECCIONES FIN' not in xl.sheet_names:
-        raise ValueError(
-            f"Hoja 'PROYECCIONES FIN' no encontrada. "
-            f"Hojas disponibles: {xl.sheet_names}"
-        )
-
-    df   = pd.read_excel(io.BytesIO(excel_bytes), sheet_name='PROYECCIONES FIN')
-    data = _transform_adc(df)
-
-    conn   = get_connection()
-    cursor = conn.cursor()
-    _ensure_proyecciones_table(conn)
-
-    # Eliminar solo las filas AdC de los (contrato, proyecto) que trae el archivo
-    combos = data[['contrato', 'proyecto']].drop_duplicates()
-    for _, row in combos.iterrows():
-        cursor.execute(
-            "DELETE FROM dbo.proyecciones "
-            "WHERE contrato=? AND proyecto=? AND tipo_proyeccion='AdC'",
-            str(row['contrato']), str(row['proyecto'])
-        )
-    conn.commit()
-
-    cols  = ['contrato', 'proyecto', 'periodo', 'monto_proyectado', 'monto_usd', 'moneda', 'tipo_proyeccion', 'fecha_carga']
-    ph    = ','.join(['?'] * len(cols))
-    names = ','.join(f'[{c}]' for c in cols)
-    sql   = f"INSERT INTO [dbo].[proyecciones] ({names}) VALUES ({ph})"
-
-    rows = data[cols].astype(object).where(pd.notna(data[cols]), None).values.tolist()
-    for i in range(0, len(rows), 500):
-        cursor.executemany(sql, rows[i:i + 500])
-    conn.commit()
-    conn.close()
-
-    return {
-        "filas_insertadas": len(rows),
-        "contratos":        int(data['contrato'].nunique()),
-        "proyectos":        int(data['proyecto'].nunique()),
-        "periodos":         sorted(data['periodo'].dropna().unique().tolist()),
-        "ultima_carga":     data['fecha_carga'].iloc[0] if len(data) else None,
-    }
 
 
 # ── Carga desde parquet P&C ───────────────────────────────────────────────────
@@ -593,7 +412,6 @@ BEGIN
         proyecto         NVARCHAR(300) NULL,
         periodo          NVARCHAR(7)   NOT NULL,
         monto_proyectado DECIMAL(18,2) NULL,
-        monto_usd        DECIMAL(18,2) NULL,
         moneda           NVARCHAR(10)  NULL,
         tipo_proyeccion  NVARCHAR(10)  NULL,
         fecha_carga      DATETIME      NOT NULL CONSTRAINT DF_proyecciones_fecha_carga DEFAULT GETDATE(),
@@ -608,73 +426,23 @@ END
 def _ensure_proyecciones_table(conn: pyodbc.Connection) -> None:
     cursor = conn.cursor()
     cursor.execute(_CREATE_PROYECCIONES)
-    cursor.execute("""
-        IF NOT EXISTS (
-            SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='proyecciones' AND COLUMN_NAME='monto_usd'
-        )
-        ALTER TABLE dbo.proyecciones ADD monto_usd DECIMAL(18,2) NULL
-    """)
     conn.commit()
 
 
 def _transform_pyc(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
 
-    date_cols  = [c for c in df.columns if len(c) == 10 and c[4] == '-' and c[7] == '-']
-    price_cols = ['PRECIO UNITARIO (CLP $)', 'PRECIO UNITARIO (US$)']
-    id_cols    = [c for c in ['CODIGO PROVEEDOR', 'ID_BLANCO', 'MONEDA'] + price_cols
-                  if c in df.columns]
+    date_cols = [c for c in df.columns if len(c) == 10 and c[4] == '-' and c[7] == '-']
+    id_cols   = [c for c in ['CODIGO PROVEEDOR', 'ID_BLANCO', 'MONEDA'] if c in df.columns]
 
     for col in date_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    for col in price_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    precio_clp_col = 'PRECIO UNITARIO (CLP $)'
-    precio_usd_col = 'PRECIO UNITARIO (US$)'
-    has_prices = (
-        df[precio_clp_col].notna() & (df[precio_clp_col] > 0) &
-        df[precio_usd_col].notna() & (df[precio_usd_col] > 0)
-    ) if precio_clp_col in df.columns and precio_usd_col in df.columns else pd.Series(False, index=df.index)
-    df_priced = df[has_prices].copy()
-
-    # Ordenar por versión DESC luego fecha_modificacion DESC.
-    # _version_presupuesto tiene prefijo numérico (ej. "09 Ver EAT Ant" → 9).
-    # Al dedupar después del melt (filtrando cero), la primera fila no-cero
-    # corresponde a la versión más alta que cubre ese mes → "última versión gana,
-    # y para meses no cubiertos por ella toma el último que los cubra".
-    if '_version_presupuesto' in df_priced.columns:
-        df_priced['_ver_num'] = pd.to_numeric(
-            df_priced['_version_presupuesto'].str.extract(r'^(\d+)', expand=False),
-            errors='coerce',
-        ).fillna(0)
-    else:
-        df_priced['_ver_num'] = 0
-
-    if '_fecha_modificacion' in df_priced.columns:
-        df_priced['_fecha_mod'] = pd.to_datetime(
-            df_priced['_fecha_modificacion'], errors='coerce'
-        )
-    else:
-        df_priced['_fecha_mod'] = pd.Timestamp('1970-01-01')
-
-    df_priced = df_priced.sort_values(
-        ['_ver_num', '_fecha_mod'], ascending=[False, False]
+    df_long = df[id_cols + date_cols].melt(
+        id_vars=id_cols, value_vars=date_cols,
+        var_name='fecha_col', value_name='monto'
     )
-
-    df_priced['_ratio_clp'] = df_priced[precio_clp_col] / df_priced[precio_usd_col]
-
-    key_col = 'KEY' if 'KEY' in df_priced.columns else None
-    melt_ids = (([key_col] if key_col else []) + id_cols + ['_ratio_clp'])
-    df_long = df_priced[melt_ids + date_cols].melt(
-        id_vars=melt_ids, value_vars=date_cols,
-        var_name='fecha_col', value_name='monto_usd'
-    )
-    df_long = df_long[df_long['monto_usd'].notna() & (df_long['monto_usd'] > 0)].copy()
-
-    df_long['monto']   = df_long['monto_usd'] * df_long['_ratio_clp']
+    df_long = df_long[df_long['monto'].notna() & (df_long['monto'] > 0)].copy()
     df_long['periodo'] = df_long['fecha_col'].str[:7]
 
     df_long.rename(columns={
@@ -683,25 +451,15 @@ def _transform_pyc(df: pd.DataFrame) -> pd.DataFrame:
         'MONEDA':           'moneda',
     }, inplace=True)
 
-    # Dedup post-melt: para cada (contrato, KEY, proyecto, periodo) conservar
-    # la primera fila no-cero = versión más alta que cubre ese mes.
-    if key_col:
-        # KEY puede ser NaN; lo combinamos con proyecto para no colapsar items sin KEY
-        df_long['_dedup_key'] = (
-            df_long[key_col].astype(str).fillna('') + '||' + df_long['proyecto'].astype(str)
-        )
-        df_long = df_long.drop_duplicates(subset=['contrato', '_dedup_key', 'periodo'])
-        df_long = df_long.drop(columns=[key_col, '_dedup_key'], errors='ignore')
-
     group = [c for c in ['contrato', 'proyecto', 'periodo', 'moneda'] if c in df_long.columns]
     result = df_long.groupby(group, dropna=False).agg(
-        monto_proyectado=('monto',     'sum'),
-        monto_usd       =('monto_usd', 'sum'),
+        monto_proyectado=('monto', 'sum')
     ).reset_index()
 
     result['tipo_proyeccion'] = 'P&C'
     result['fecha_carga']     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # contrato es NOT NULL en la tabla destino
     result = result[result['contrato'].notna() & (result['contrato'].astype(str).str.strip() != '')]
     return result
 
@@ -716,7 +474,7 @@ def load_proyecciones_pyc(df: pd.DataFrame) -> dict:
     cursor.execute("TRUNCATE TABLE [dbo].[proyecciones]")
     conn.commit()
 
-    cols  = ['contrato', 'proyecto', 'periodo', 'monto_proyectado', 'monto_usd', 'moneda', 'tipo_proyeccion', 'fecha_carga']
+    cols  = ['contrato', 'proyecto', 'periodo', 'monto_proyectado', 'moneda', 'tipo_proyeccion', 'fecha_carga']
     ph    = ','.join(['?'] * len(cols))
     names = ','.join(f'[{c}]' for c in cols)
     sql   = f"INSERT INTO [dbo].[proyecciones] ({names}) VALUES ({ph})"
@@ -877,15 +635,31 @@ def query_df_bi(sql: str) -> pd.DataFrame:
 
 # ── PAI Proyectos ─────────────────────────────────────────────────────────────
 
+def _keep_latest_pai(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Retiene solo la versión más reciente de PAI_Proyectos para evitar duplicados."""
+    ano_col = next((c for c in df.columns if c in ('ano_pai', 'año_pai', 'anio_pai')), None)
+    ver_col = next((c for c in df.columns if 'version' in c.lower()), None)
+    fc_col  = next((c for c in df.columns if 'fecha_carga' in c), None)
+    if ano_col and ver_col:
+        latest = df.groupby(ano_col)[ver_col].max().reset_index(name='_max_ver')
+        df = df.merge(latest, on=ano_col)
+        df = df[df[ver_col] == df['_max_ver']].drop(columns='_max_ver').copy()
+    elif fc_col:
+        latest_date = str(df[fc_col].max())[:10]
+        df = df[df[fc_col].astype(str).str[:10] == latest_date].copy()
+    return df
+
+
 def get_pai_proyectos() -> list[dict]:
     df = query_df_bi("SELECT * FROM dbo.PAI_Proyectos")
     df.columns = [_normalize_col(c) for c in df.columns]
 
-    # Normalizar columna mes a YYYY-MM
+    df = _keep_latest_pai(df)
+
+    # Normalizar columna mes a YYYY-MM (formato explícito para evitar ambigüedad con dayfirst)
     if 'mes' in df.columns:
-        parsed = pd.to_datetime(df['mes'], dayfirst=True, errors='coerce')
-        mask = parsed.notna()
-        df.loc[mask, 'mes'] = parsed[mask].dt.strftime('%Y-%m')
+        parsed = pd.to_datetime(df['mes'], format='%Y-%m-%d', errors='coerce')
+        df['mes'] = parsed.dt.strftime('%Y-%m').where(parsed.notna(), '')
 
     # Convertir columnas de metros a numérico
     for col in [c for c in df.columns if 'metro' in c]:
