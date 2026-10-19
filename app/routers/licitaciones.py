@@ -152,19 +152,18 @@ def _load_detalles(proceso: str) -> list[dict]:
         ini_real, fin_real = _parse_timeline(cv.get("real_real__1", ""))
 
         ciclo_prog = cv.get("n_meros__1", "")
-        ciclo_real_v = cv.get("formula_mkx1wb7g", "")
 
         result.append({
-            "Nombre Etapa":           cv.get("etapa__1", "") or item["name"],
+            "Subelemento":            cv.get("etapa__1", "") or item["name"],
             "N° PROCESO":             n_proceso,
             "Fecha Inicio Acta inicio": ini_prog,
             "Fecha Fin Acta Inicio":  fin_prog,
             "Inicio real":            ini_real,
             "Fin real":               fin_real,
             "Ciclo programado":       float(ciclo_prog) if ciclo_prog else None,
-            "Ciclo real":             float(ciclo_real_v) if ciclo_real_v else None,
-            "Área Responsable":       cv.get("color_mkxwnv9b", ""),
-            "Estado Inicio-Fin":      cv.get("prueba_estado__1", ""),
+            "Ciclo real":             _days_between(ini_real, fin_real),
+            "Área Responsable":       cv.get("color_mkxwnv9b", "") or cv.get("text_mkxwnv9b", "") or cv.get("dropdown_mkxwnv9b", ""),
+            "Estado_Inicio-Fin":      cv.get("prueba_estado__1", "") or cv.get("estado__1", ""),
             "Avance Etapas":          cv.get("prueba_avance__1", ""),
             "Justificación":          cv.get("observaci_n__1", ""),
         })
@@ -201,7 +200,43 @@ def get_proceso_detalle(proceso: str = Query(...)):
     return _load_detalles(proceso)
 
 
+@router.get("/procesos/detalle/debug")
+def get_proceso_detalle_debug(proceso: str = Query(...)):
+    """Devuelve los column_values crudos del primer ítem que coincida con el proceso."""
+    raw = _fetch_board_items(MONDAY_PROCESOS_SUB_BOARD_ID)
+    for item in raw:
+        cv = {c["id"]: (c.get("text") or "") for c in item["column_values"]}
+        n_proceso = cv.get("n__proceso__1", "").strip()
+        if n_proceso and proceso.lower() in n_proceso.lower():
+            return {"item_name": item["name"], "column_values": cv}
+    return {"error": "No se encontró ítem para ese proceso"}
+
+
 # ── Endpoints: Pipeline SOLPE ─────────────────────────────────────────────────
+
+@router.get("/debug-estados")
+def get_debug_estados():
+    """Muestra los valores únicos de Estado_SOLPE y a qué grupo caen."""
+    try:
+        from app.data.loader import load_solpe
+        load_solpe.cache_clear()
+        sol = load_solpe()
+        columnas = list(sol.columns)
+        if "Estado_SOLPE" not in columnas:
+            return {"error": "Sin columna Estado_SOLPE", "columnas": columnas, "filas": len(sol)}
+        conteo = (
+            sol.groupby(["Estado_SOLPE", "Grupo_Estado"], dropna=False)
+            .size()
+            .reset_index(name="cantidad")
+            .sort_values("Grupo_Estado")
+        )
+        return {
+            "filas_total": len(sol),
+            "estados": conteo.fillna("(vacío)").to_dict("records"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @router.get("/kpis")
 def get_kpis():

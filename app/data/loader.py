@@ -84,15 +84,19 @@ def load_solpe() -> pd.DataFrame:
 
     def grupo(estado):
         if pd.isna(estado):
-            return "Iniciada"
+            return "En Proceso"
         e = str(estado)
         if e in ("Cerrada", "Aplicado"):
             return "Cerrada"
         if e == "Rechazada":
             return "Rechazada"
-        if e in ("Gestionada",) or e.startswith("Enviada"):
+        if e == "Aceptada":
+            return "Aceptada"
+        if e == "Enviado a PyC":
+            return "Enviado a PyC"
+        if e in ("Gestionada", "En Gestión") or e.startswith("Enviada"):
             return "En Proceso"
-        return "Iniciada"
+        return "En Proceso"
 
     df["Grupo_Estado"] = df["Estado_SOLPE"].apply(grupo)
     return df

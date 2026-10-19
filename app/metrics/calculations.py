@@ -405,92 +405,101 @@ def saldo_timeline_por_proyecto(
     meses_fut: int = 18,
 ) -> dict:
     """
-    Matriz de saldo mínimo por proyecto × mes.
-    Para cada proyecto, el valor de cada mes es el mínimo saldo entre todos los
-    contratos que lo abastecen. Rojo cuando alguno se agota (saldo ≤ 0).
+    Proyección de saldo mínimo agrupada por proyecto.
+    Para cada proyecto: saldos_min[i] = min saldo del contrato más ajustado en ese mes.
+    Usa la columna 'Proyecto' del EP para asignar contratos a proyectos.
     """
     tl = saldo_timeline(
         tipo_proyeccion=tipo_proyeccion,
         meses_hist=meses_hist,
         meses_fut=meses_fut,
-        limite=999,
+        limite=9999,
     )
 
-    meses      = tl['meses']
-    mes_actual = tl['mes_actual']
+    month_list     = tl['meses']
+    mes_actual     = tl['mes_actual']
+    mes_actual_idx = tl['mes_actual_idx']
+    n_meses        = len(month_list)
 
+    empty = {'proyectos': [], 'meses': month_list, 'mes_actual': mes_actual, 'mes_actual_idx': mes_actual_idx}
     if not tl['contratos']:
-        return {
-            'meses': meses, 'mes_actual': mes_actual,
-            'mes_actual_idx': tl['mes_actual_idx'],
-            'proyectos': [], 'tiene_proyecciones': tl['tiene_proyecciones'],
-        }
+        return empty
 
-    # Mapeo proyecto → contratos desde EP (fuente principal)
+    # Mapas contrato → saldos y → mes_agotamiento individual
+    ctt_saldo_map: dict[str, list[float]]  = {c['codigo_ctt']: c['saldos'] for c in tl['contratos']}
+    ctt_agot_map:  dict[str, str | None]   = {c['codigo_ctt']: c.get('mes_agotamiento') for c in tl['contratos']}
+
+    # Mapa contrato → set de proyectos, desde columna Proyecto del EP
     ep       = load_ep()
     proj_col = next((c for c in ep.columns if c.lower() == 'proyecto'), None)
-    proy_ctts: dict[str, set[str]] = {}
+
+    ctt_to_projs: dict[str, set[str]] = {}
     if proj_col:
-        for proy_val, grp in ep.dropna(subset=[proj_col]).groupby(proj_col):
-            p = str(proy_val).strip()
-            if p and p not in ('nan', 'None', ''):
-                for ctt in grp['codigo_ctt'].astype(str).str.strip():
-                    if ctt:
-                        proy_ctts.setdefault(p, set()).add(ctt)
+        ep_valid = ep[ep['codigo_ctt'].astype(str).isin(ctt_saldo_map)]
+        for ctt_code, grp in ep_valid.groupby('codigo_ctt'):
+            key  = str(ctt_code)
+            vals = {str(v).strip() for v in grp[proj_col].dropna()
+                    if str(v).strip() not in ('', 'nan', 'None', 'NaN')}
+            if vals:
+                ctt_to_projs[key] = vals
 
-    # Complementar con proyectos desde proyecciones P&C (campo 'proyectos' en timeline)
-    for ctt_data in tl['contratos']:
-        for p in (x.strip() for x in (ctt_data.get('proyectos') or '').split(',') if x.strip()):
-            proy_ctts.setdefault(p, set()).add(ctt_data['codigo_ctt'])
+    # Complementar con el campo 'proyectos' del saldo_timeline (fuente P&C)
+    for ctt in tl['contratos']:
+        pstr = ctt.get('proyectos', '') or ''
+        extras = {p.strip() for p in pstr.split(',') if p.strip()}
+        if extras:
+            ctt_to_projs.setdefault(ctt['codigo_ctt'], set()).update(extras)
 
-    ctt_map = {c['codigo_ctt']: c for c in tl['contratos']}
-    n_meses = len(meses)
+    # Invertir: proyecto → lista de contratos
+    proy_ctts: dict[str, list[str]] = {}
+    for ctt_code, projs in ctt_to_projs.items():
+        for proy in projs:
+            proy_ctts.setdefault(proy, []).append(ctt_code)
+
+    # Contratos sin proyecto asignado
+    unassigned = [c['codigo_ctt'] for c in tl['contratos'] if c['codigo_ctt'] not in ctt_to_projs]
+    if unassigned:
+        proy_ctts['(Sin proyecto)'] = unassigned
 
     result = []
-    for proy in sorted(proy_ctts.keys()):
-        matching = [ctt_map[c] for c in proy_ctts[proy] if c in ctt_map]
-        if not matching:
+    for proy_name, ctt_codes in proy_ctts.items():
+        valid = [c for c in set(ctt_codes) if c in ctt_saldo_map]
+        if not valid:
             continue
 
+        arrays = [ctt_saldo_map[c] for c in valid]
         saldos_min = [
-            min(c['saldos'][i] for c in matching)
+            min(arr[i] for arr in arrays if i < len(arr))
             for i in range(n_meses)
         ]
 
-        # Agotamiento del proyecto = mínima fecha de agotamiento entre sus contratos
-        agots = [c['mes_agotamiento'] for c in matching if c['mes_agotamiento']]
-        mes_agot = min(agots) if agots else None
-
-        # Cuello de botella: contrato que agota primero
-        contrato_critico = None
-        if mes_agot:
-            criticos = sorted(
-                [c for c in matching if c['mes_agotamiento']],
-                key=lambda c: c['mes_agotamiento'],
-            )
-            contrato_critico = criticos[0]['codigo_ctt']
+        # Agotamiento del proyecto = mínimo mes_agotamiento entre sus contratos
+        agots = [(c, ctt_agot_map[c]) for c in valid if ctt_agot_map.get(c)]
+        if agots:
+            contrato_critico, mes_agotamiento = min(agots, key=lambda x: x[1])
+        else:
+            mes_agotamiento  = None
+            contrato_critico = None
 
         result.append({
-            'proyecto':         proy,
-            'n_contratos':      len(matching),
-            'contratos':        [c['codigo_ctt'] for c in matching],
-            'saldos_min':       saldos_min,
-            'mes_agotamiento':  mes_agot,
+            'proyecto':         proy_name,
+            'n_contratos':      len(valid),
+            'contratos':        valid,
+            'mes_agotamiento':  mes_agotamiento,
             'contrato_critico': contrato_critico,
+            'saldos_min':       [round(float(v)) for v in saldos_min],
         })
 
     result.sort(key=lambda r: (
         0 if r['mes_agotamiento'] else 1,
         r['mes_agotamiento'] or '',
-        r['proyecto'],
     ))
 
     return {
-        'meses':              meses,
-        'mes_actual':         mes_actual,
-        'mes_actual_idx':     tl['mes_actual_idx'],
-        'proyectos':          result,
-        'tiene_proyecciones': tl['tiene_proyecciones'],
+        'proyectos':      result,
+        'meses':          month_list,
+        'mes_actual':     mes_actual,
+        'mes_actual_idx': mes_actual_idx,
     }
 
 
@@ -714,10 +723,11 @@ def ep_por_tipo_contrato(estado_ctt: str = '', area: str = '', tipo: str = '', d
 def licitaciones_kpis() -> dict:
     sol = load_solpe()
     total     = len(sol)
-    en_proc   = int((sol["Grupo_Estado"] == "En Proceso").sum())
-    cerradas  = int((sol["Grupo_Estado"] == "Cerrada").sum())
-    rechaz    = int((sol["Grupo_Estado"] == "Rechazada").sum())
-    iniciadas = int((sol["Grupo_Estado"] == "Iniciada").sum())
+    en_proc      = int((sol["Grupo_Estado"] == "En Proceso").sum())
+    cerradas     = int((sol["Grupo_Estado"] == "Cerrada").sum())
+    rechaz       = int((sol["Grupo_Estado"] == "Rechazada").sum())
+    aceptadas    = int((sol["Grupo_Estado"] == "Aceptada").sum())
+    enviado_pyc  = int((sol["Grupo_Estado"] == "Enviado a PyC").sum())
 
     dias_prom = None
     cerr = sol[sol["Grupo_Estado"] == "Cerrada"]["Dias_Gestion"].dropna()
@@ -737,7 +747,8 @@ def licitaciones_kpis() -> dict:
         "en_proceso": en_proc,
         "cerradas": cerradas,
         "rechazadas": rechaz,
-        "iniciadas": iniciadas,
+        "aceptadas": aceptadas,
+        "enviado_pyc": enviado_pyc,
         "dias_promedio_gestion": dias_prom,
         "monto_en_gestion": monto_en_gestion,
         "tasa_adjudicacion": tasa,
@@ -981,6 +992,7 @@ def ep_timeline(
     Matriz de EP por contrato × mes.
     Columnas fijas: contrato, descripcion, area, tipo, total_ep, num_eps.
     Columnas de meses: EP consumido en ese mes (0 si no hubo).
+    Cada contrato incluye 'proyectos': desglose por proyecto con sus propios eps[].
     """
     df = _ep_base(area, tipo, contrato, estado_ctt, proyecto, periodo_desde, periodo_hasta)
     mes_actual = pd.Timestamp.now().strftime('%Y-%m')
@@ -989,6 +1001,7 @@ def ep_timeline(
         return {'meses': [], 'mes_actual': mes_actual, 'contratos': [], 'total_contratos': 0}
 
     meses: list[str] = sorted(df['periodo'].dropna().unique().tolist())
+    proj_col = next((c for c in df.columns if c.lower() == 'proyecto'), None)
 
     # EP por (contrato, periodo)
     ep_mx = df.groupby(['codigo_ctt', 'periodo'])['monto_CLP'].sum()
@@ -1007,11 +1020,61 @@ def ep_timeline(
         attrs = df[['codigo_ctt'] + attrs_cols].drop_duplicates('codigo_ctt')
         ctts_grp = ctts_grp.merge(attrs, on='codigo_ctt', how='left')
 
+    # Pre-agrupar por proyecto y descripción para evitar filtrado repetido dentro del loop
+    desc_col = 'item_descripcion' if 'item_descripcion' in df.columns else None
+
+    if proj_col:
+        proy_ep_mx = df.groupby(['codigo_ctt', proj_col, 'periodo'])['monto_CLP'].sum()
+        proy_totals = (
+            df.groupby(['codigo_ctt', proj_col])
+            .agg(total_ep=('monto_CLP', 'sum'), num_eps=('monto_CLP', 'count'))
+            .reset_index()
+        )
+
+    if proj_col and desc_col:
+        desc_ep_mx = df.groupby(['codigo_ctt', proj_col, desc_col, 'periodo'])['monto_CLP'].sum()
+        desc_totals = (
+            df.groupby(['codigo_ctt', proj_col, desc_col])
+            .agg(total_ep=('monto_CLP', 'sum'), num_eps=('monto_CLP', 'count'))
+            .reset_index()
+        )
+
     total = int(df['codigo_ctt'].nunique())
     result = []
     for _, row in ctts_grp.iterrows():
         ctt = str(row['codigo_ctt'])
         eps = [round(float(ep_mx.get((ctt, m), 0) or 0)) for m in meses]
+
+        proyectos: list[dict] = []
+        if proj_col:
+            ctt_proy = proy_totals[proy_totals['codigo_ctt'] == ctt]
+            for _, pr in ctt_proy.iterrows():
+                pname = str(pr[proj_col] or '')
+                eps_p = [round(float(proy_ep_mx.get((ctt, pr[proj_col], m), 0) or 0)) for m in meses]
+
+                descripciones: list[dict] = []
+                if desc_col:
+                    mask = (desc_totals['codigo_ctt'] == ctt) & (desc_totals[proj_col] == pr[proj_col])
+                    for _, dr in desc_totals[mask].iterrows():
+                        dval = dr[desc_col]
+                        eps_d = [round(float(desc_ep_mx.get((ctt, pr[proj_col], dval, m), 0) or 0)) for m in meses]
+                        descripciones.append({
+                            'descripcion': str(dval or ''),
+                            'total_ep':    round(float(dr['total_ep'])),
+                            'num_eps':     int(dr['num_eps']),
+                            'eps':         eps_d,
+                        })
+                    descripciones.sort(key=lambda x: x['total_ep'], reverse=True)
+
+                proyectos.append({
+                    'proyecto':      pname,
+                    'total_ep':      round(float(pr['total_ep'])),
+                    'num_eps':       int(pr['num_eps']),
+                    'eps':           eps_p,
+                    'descripciones': descripciones,
+                })
+            proyectos.sort(key=lambda x: x['total_ep'], reverse=True)
+
         result.append({
             'codigo_ctt':  ctt,
             'descripcion': str(row.get('Descripcion_ctt', '') or ''),
@@ -1021,6 +1084,7 @@ def ep_timeline(
             'total_ep':    round(float(row['total_ep'])),
             'num_eps':     int(row['num_eps']),
             'eps':         eps,
+            'proyectos':   proyectos,
         })
 
     return {
