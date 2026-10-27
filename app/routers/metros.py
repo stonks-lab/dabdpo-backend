@@ -16,10 +16,16 @@ def _classify_tipo(desc: str) -> str | None:
     return None
 
 
+@router.get("/pai/versiones")
+def list_pai_versiones():
+    from app.data.sql_server import get_pai_versiones
+    return get_pai_versiones()
+
+
 @router.get("/pai")
-def get_pai():
+def get_pai(ano: int | None = None, version: str | None = None):
     from app.data.sql_server import get_pai_proyectos
-    return get_pai_proyectos()
+    return get_pai_proyectos(ano=ano, version=version)
 
 
 @router.get("/avance")
@@ -55,6 +61,34 @@ def get_presupuesto_perforacion():
     # Strip leading "NN." version prefix from project code
     metros['proyecto'] = metros['_codigo_proyecto'].str.replace(r'^\d{2}\.', '', regex=True).str.strip()
 
+    # Drop rows whose project code has no letters or no digits (years, junk like "Rev", "Formulación")
+    has_letter = metros['proyecto'].str.contains(r'[A-Za-z]', regex=True, na=False)
+    has_digit  = metros['proyecto'].str.contains(r'\d',       regex=True, na=False)
+    metros = metros[has_letter & has_digit].copy()
+
+    # Build nombre map: parquet ID_BLANCO → NOM_RESUMEN_ID_BLANCO from dim_proyectos
+    nombre_map: dict[str, str] = {}
+    try:
+        from app.data.sql_server import query_df as _qdf
+        dim = _qdf("SELECT ID_BLANCO, NOM_RESUMEN_ID_BLANCO FROM dbo.dim_proyectos")
+        for _, r in dim.iterrows():
+            k = str(r['ID_BLANCO'] or '').strip()
+            v = str(r['NOM_RESUMEN_ID_BLANCO'] or '').strip()
+            if k and v and v.lower() not in ('nan', 'none', ''):
+                nombre_map[k] = v
+    except Exception:
+        pass
+
+    # For each proyecto, pick the ID_BLANCO with the most meters (most representative blanco)
+    blanco_per_proy: dict[str, str] = {}
+    if 'ID_BLANCO' in metros.columns:
+        bp = (
+            metros.groupby(['proyecto', 'ID_BLANCO'])['ctd'].sum()
+            .reset_index().sort_values('ctd', ascending=False)
+        )
+        for p, grp_p in bp.groupby('proyecto'):
+            blanco_per_proy[str(p)] = str(grp_p.iloc[0]['ID_BLANCO']).strip()
+
     grp = metros.groupby(['proyecto', 'tipo']).agg(
         metros_ppt=('ctd', 'sum'),
         ppt_usd=('ppt_usd', 'sum'),
@@ -71,7 +105,9 @@ def get_presupuesto_perforacion():
         p = row['proyecto']
         t = row['tipo'].lower()
         if p not in pivot:
-            pivot[p] = {'proyecto': p}
+            blanco = blanco_per_proy.get(p, p)
+            nombre = nombre_map.get(blanco) or nombre_map.get(p, '')
+            pivot[p] = {'proyecto': p, 'nombre': nombre}
         pivot[p][f'metros_{t}']       = round(float(row['metros_ppt']), 1)
         pivot[p][f'ppt_usd_{t}']      = round(float(row['ppt_usd']), 0)
         upm = row['usd_por_metro']
@@ -94,6 +130,60 @@ def get_presupuesto_perforacion():
     }
 
     return {'proyectos': proyectos, 'totales': totales}
+
+
+@router.get("/cruce/debug")
+def get_cruce_debug():
+    """Muestra qué códigos de proyecto existen en PAI vs Avance y cuántos cruzan."""
+    from app.data.sql_server import query_df_bi, get_pai_proyectos, get_avance_semanal
+    import pandas as pd
+
+    pai = pd.DataFrame(get_pai_proyectos())
+    av  = pd.DataFrame(get_avance_semanal())
+
+    def find_proj_col(df: pd.DataFrame, hints: list[str]) -> str | None:
+        for hint in hints:
+            for c in df.columns:
+                if hint in c:
+                    non_empty = df[c].replace('', pd.NA).dropna()
+                    if len(non_empty) > 0:
+                        return c
+        return None
+
+    pai_col = find_proj_col(pai, ['project', 'blanco'])
+    av_col  = find_proj_col(av,  ['project', 'proyecto'])
+
+    pai_vals = set(pai[pai_col].dropna().astype(str).unique()) if pai_col else set()
+    av_vals  = set(av[av_col].dropna().replace('', pd.NA).dropna().astype(str).unique()) if av_col else set()
+
+    return {
+        "pai_columna_detectada": pai_col,
+        "av_columna_detectada":  av_col,
+        "pai_valores_unicos":    sorted(pai_vals)[:50],
+        "av_valores_unicos":     sorted(av_vals)[:50],
+        "en_pai_no_en_av":       sorted(pai_vals - av_vals)[:30],
+        "en_av_no_en_pai":       sorted(av_vals  - pai_vals)[:30],
+        "cruzan":                sorted(pai_vals & av_vals)[:30],
+    }
+
+
+@router.get("/avance/debug")
+def get_avance_debug():
+    """Muestra columnas y muestra de valores de Avance_Semanal para diagnosticar claves de proyecto."""
+    from app.data.sql_server import query_df_bi
+
+    df = query_df_bi("SELECT TOP 50 * FROM dbo.Avance_Semanal")
+    df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
+
+    return {
+        "columnas": list(df.columns),
+        "muestra_10_filas": df.head(10).fillna('').to_dict('records'),
+        "valores_unicos_por_columna": {
+            col: sorted(df[col].dropna().astype(str).unique().tolist())[:20]
+            for col in df.columns
+            if df[col].nunique() < 50
+        },
+    }
 
 
 @router.get("/pai/debug")

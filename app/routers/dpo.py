@@ -27,6 +27,12 @@ def delete_mes(anio: int, mes: int):
     return delete_costo_metro_mes(anio, mes)
 
 
+@router.get("/proyectos-inicio")
+def get_proyectos_inicio(fecha_desde: str | None = None, fecha_hasta: str | None = None):
+    from app.data.sql_server import get_proyectos_inicio_resumen
+    return get_proyectos_inicio_resumen(fecha_desde, fecha_hasta)
+
+
 @router.get("/config")
 def get_config():
     from app.data.sql_server import get_config_dpo

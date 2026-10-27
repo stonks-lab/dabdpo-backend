@@ -205,6 +205,26 @@ async def upload_costo_metro(file: UploadFile = File(...), usuario: str = ""):
     return total
 
 
+# ── Proyectos Inicio ─────────────────────────────────────────────────────────
+
+@router.post("/proyectos-inicio")
+async def upload_proyectos_inicio(file: UploadFile = File(...), usuario: str = ""):
+    if not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls')):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos .xlsx o .xls")
+
+    content = await file.read()
+    try:
+        from app.data.sql_server import upsert_proyectos_inicio, log_carga
+        result = upsert_proyectos_inicio(content)
+        log_carga("dbo.ProyectosInicio", "Plataforma", file.filename, usuario or None)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al cargar en SQL Server: {e}")
+
+    return result
+
+
 # ── Registro de cargas ────────────────────────────────────────────────────────
 
 @router.get("/registro")
