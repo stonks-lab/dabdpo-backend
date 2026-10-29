@@ -48,6 +48,21 @@ def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
         conn.close()
 
 
+# ── Proveedores EP ───────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=None)
+def get_proveedor_map_ep() -> dict:
+    """Devuelve dict {codigo_ctt: proveedor} desde dbo.SIC_EPs."""
+    try:
+        df = query_df(
+            "SELECT [Contrato Código] AS codigo_ctt, MAX(Proveedor) AS proveedor "
+            "FROM dbo.SIC_EPs WHERE Proveedor IS NOT NULL GROUP BY [Contrato Código]"
+        )
+        return dict(zip(df['codigo_ctt'].astype(str), df['proveedor'].astype(str)))
+    except Exception:
+        return {}
+
+
 # ── Proyecciones ─────────────────────────────────────────────────────────────
 
 def get_proyecciones(

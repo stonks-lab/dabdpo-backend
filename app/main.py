@@ -36,7 +36,7 @@ def health():
 
 
 # ── Servir frontend (build de React) ─────────────────────────────────────────
-DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 if DIST.exists():
     app.mount("/assets", StaticFiles(directory=str(DIST / "assets")), name="assets")

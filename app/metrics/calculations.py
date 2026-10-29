@@ -1,6 +1,7 @@
 import pandas as pd
 from functools import lru_cache
 from app.data.loader import load_ep, load_solpe, load_boletas
+from app.data.sql_server import get_proveedor_map_ep
 
 
 # ── Exchange rates ─────────────────────────────────────────────────────────────
@@ -1040,6 +1041,7 @@ def ep_timeline(
         )
 
     total = int(df['codigo_ctt'].nunique())
+    prov_map = get_proveedor_map_ep()
     result = []
     for _, row in ctts_grp.iterrows():
         ctt = str(row['codigo_ctt'])
@@ -1078,6 +1080,7 @@ def ep_timeline(
         result.append({
             'codigo_ctt':  ctt,
             'descripcion': str(row.get('Descripcion_ctt', '') or ''),
+            'proveedor':   prov_map.get(ctt, ''),
             'area':        str(row.get('Area_contrato',   '') or ''),
             'tipo':        str(row.get('Tipo_contrato',   '') or ''),
             'estado_ctt':  str(row.get('Estado_ctt',      '') or ''),
