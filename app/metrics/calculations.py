@@ -780,7 +780,10 @@ def alertas_contratos() -> list[dict]:
     cols = ["codigo_ctt", "Descripcion_ctt", "Tipo_contrato", "Area_contrato",
             "Estado_ctt", "Presupuesto_CLP", "EP_Consumido_CLP", "Saldo_CLP",
             "Pct_Saldo", "Estado_Saldo"]
-    return criticos[cols].sort_values("Pct_Saldo").to_dict("records")
+    result = criticos[cols].sort_values("Pct_Saldo").copy()
+    prov_map = get_proveedor_map_ep()
+    result["Proveedor"] = result["codigo_ctt"].map(prov_map).fillna("")
+    return result.to_dict("records")
 
 
 def analisis_kpis() -> dict:

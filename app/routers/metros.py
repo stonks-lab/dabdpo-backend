@@ -348,62 +348,144 @@ def get_curva_s(tipo: str = "all", ano: int | None = None):
 
     total_av = sum(av_by_month.values())
 
-    # ── D. Financial actual from SIC_EPs (best-effort, filtered to perforación) ─
+    # ── D. Financial actual from SIC_EPs (filtered to perforación contracts) ─
     from app.data.sql_server import query_df
 
-    ep_by_month: dict[str, float] = {}
+    ep_by_month:        dict[str, float] = {}
+    ep_vigent_by_month: dict[str, float] = {}
     ep_filter_info = 'none'
 
     try:
         ep = query_df("SELECT * FROM dbo.SIC_EPs")
         ep.columns = [c.strip() for c in ep.columns]
 
-        # Detect project column and filter to known perforación project codes
-        prj_col = next((c for c in ep.columns if 'proyecto' in c.lower()), None)
-        ep_work = ep.copy()
-        if prj_col and proy_codes:
-            masked = ep[ep[prj_col].astype(str).str.strip().isin(proy_codes)]
-            if not masked.empty:
-                ep_work = masked
-                ep_filter_info = 'by_proyecto'
+        # Detect Contrato Código column (avoid 'Contrato id' and 'Contrato Estado')
+        contrato_col = next(
+            (c for c in ep.columns if 'contrato' in c.lower()
+             and 'id' not in c.lower() and 'estado' not in c.lower()),
+            None,
+        )
 
-        # Date: prefer HES date, fallback to Fecha Hasta
+        ep_work = ep.copy()
+
+        # Filter to perforación contracts via SIC_Contratos (position 1 = código, 21 = tipo)
+        if contrato_col:
+            try:
+                sic = query_df("SELECT * FROM dbo.SIC_Contratos ORDER BY _fecha_carga DESC")
+                if not sic.empty and len(sic.columns) > 21:
+                    sic_code_col = sic.columns[1]
+                    sic_tipo_col = sic.columns[21]
+                    sic[sic_code_col] = sic[sic_code_col].astype(str).str.strip()
+                    sic_perf = sic[
+                        sic[sic_tipo_col].astype(str).str.lower().str.contains('perfor', na=False)
+                    ]
+                    perf_ctt_codes = set(sic_perf[sic_code_col].unique())
+                    if perf_ctt_codes:
+                        masked = ep[ep[contrato_col].astype(str).str.strip().isin(perf_ctt_codes)]
+                        if not masked.empty:
+                            ep_work = masked
+                            ep_filter_info = 'by_contrato_perf'
+            except Exception:
+                pass
+
+        # Fecha: 'HES fecha' preferred, fallback 'Fecha Hasta'
         fecha_ep_col = next(
-            (c for c in ep_work.columns if 'hes' in c.lower()),
+            (c for c in ep_work.columns if 'hes' in c.lower() and 'fecha' in c.lower()),
             next((c for c in ep_work.columns if 'hasta' in c.lower()), None),
         )
 
-        if fecha_ep_col:
+        monto_col  = next((c for c in ep_work.columns if c.lower() == 'monto'), None)
+        moneda_col = next((c for c in ep_work.columns if c.lower() == 'moneda'), None)
+        cambio_col = next(
+            (c for c in ep_work.columns if 'cambio' in c.lower() and 'anual' not in c.lower()),
+            None,
+        )
+
+        if fecha_ep_col and monto_col:
             ep_work = ep_work.copy()
             ep_work['_fep'] = pd.to_datetime(ep_work[fecha_ep_col], errors='coerce')
             ep_work = ep_work.dropna(subset=['_fep'])
             ep_work['_mes'] = ep_work['_fep'].dt.strftime('%Y-%m')
 
-            monto_col  = next((c for c in ep_work.columns if c.lower() == 'monto'), None)
-            cambio_col = next((c for c in ep_work.columns if 'cambio' in c.lower()), None)
+            monto_s = pd.to_numeric(ep_work[monto_col], errors='coerce').fillna(0)
 
-            if monto_col:
-                monto_s = pd.to_numeric(ep_work[monto_col], errors='coerce').fillna(0)
+            # Currency conversion → USD
+            # Moneda: 'USD' → keep as-is; 'UF' → × 38 (≈ UF/USD); 'CLP' → / ~950
+            # Valor de Cambio = 1 means "CLP, no internal conversion" — NOT a CLP/USD rate.
+            # Use it only when it represents a real exchange rate (> 100).
+            if moneda_col:
+                moneda_s = ep_work[moneda_col].astype(str).str.strip().str.upper()
+                is_usd = moneda_s == 'USD'
+                is_uf  = moneda_s == 'UF'
                 if cambio_col:
-                    cambio_s = pd.to_numeric(ep_work[cambio_col], errors='coerce').fillna(1).replace(0, 1)
-                    # cambio > 10 → Monto already in foreign (USD); cambio ≈ 1 → Monto in CLP
-                    monto_usd = np.where(cambio_s > 10, monto_s, monto_s / 950.0)
+                    cambio_s = pd.to_numeric(ep_work[cambio_col], errors='coerce').fillna(1)
+                    # Use campo Cambio as CLP/USD rate only when it looks like a real rate (> 100)
+                    clp_rate = pd.Series(np.where(cambio_s > 100, cambio_s, 950.0), index=ep_work.index)
                 else:
-                    monto_usd = monto_s.values
+                    clp_rate = pd.Series(950.0, index=ep_work.index)
+                monto_usd = np.select(
+                    [is_usd, is_uf],
+                    [monto_s, monto_s * 38.0],
+                    default=monto_s / clp_rate,
+                )
+            else:
+                monto_usd = monto_s.values / 950.0
 
-                ep_work = ep_work.copy()
-                ep_work['_usd'] = monto_usd
-                if ano is not None:
-                    ep_work = ep_work[ep_work['_fep'].dt.year == ano]
-                for mes, grp in ep_work.groupby('_mes'):
-                    ep_by_month[str(mes)] = float(grp['_usd'].sum())
+            ep_work['_usd'] = monto_usd
+            if ano is not None:
+                ep_work = ep_work[ep_work['_fep'].dt.year == ano]
+            for mes, grp in ep_work.groupby('_mes'):
+                ep_by_month[str(mes)] = float(grp['_usd'].sum())
+
+            # EP de contratos vigentes → tasa de proyección más precisa
+            if contrato_col:
+                try:
+                    sic_v = query_df("SELECT * FROM dbo.SIC_Contratos ORDER BY _fecha_carga DESC")
+                    if not sic_v.empty:
+                        sic_v.columns = [c.strip() for c in sic_v.columns]
+                        code_v   = sic_v.columns[1] if len(sic_v.columns) > 1 else None
+                        estado_v = next(
+                            (c for c in sic_v.columns if 'estado' in c.lower() and 'contrato' in c.lower()),
+                            next((c for c in sic_v.columns if 'estado' in c.lower()), None),
+                        )
+                        if code_v and estado_v:
+                            sic_v[code_v] = sic_v[code_v].astype(str).str.strip()
+                            if '_fecha_carga' in sic_v.columns:
+                                sic_v['_fc'] = pd.to_datetime(sic_v['_fecha_carga'], errors='coerce')
+                                sic_dedup = sic_v.sort_values('_fc', ascending=False).drop_duplicates(subset=[code_v])
+                            else:
+                                sic_dedup = sic_v.drop_duplicates(subset=[code_v])
+                            vigent_set = set(
+                                sic_dedup.loc[
+                                    sic_dedup[estado_v].astype(str).str.lower().str.contains('vigente', na=False),
+                                    code_v,
+                                ].unique()
+                            )
+                            if vigent_set:
+                                ep_v = ep_work[ep_work[contrato_col].astype(str).str.strip().isin(vigent_set)]
+                                for mes_v, grp_v in ep_v.groupby('_mes'):
+                                    ep_vigent_by_month[str(mes_v)] = float(grp_v['_usd'].sum())
+                except Exception:
+                    pass
     except Exception:
         pass
 
     total_ep_usd = sum(ep_by_month.values())
 
-    # ── Build monthly time series ───────────────────────────────────────────────
+    # ── PPT = EP fallback para meses pasados sin presupuesto en parquet ────────
     hoy = date.today().strftime('%Y-%m')
+    for m, ep_val in list(ep_by_month.items()):
+        if m <= hoy and not ppt_by_month.get(m, 0.0) and ep_val > 0:
+            ppt_by_month[m] = ep_val
+    total_ppt_usd = sum(ppt_by_month.values())
+
+    # Último mes con EP real; proyección arranca desde aquí, no desde hoy
+    last_ep_month = max((m for m in ep_by_month if ep_by_month[m] > 0), default=None)
+    # Fallback: si no pudimos filtrar vigentes, usamos todo ep_by_month
+    if not ep_vigent_by_month:
+        ep_vigent_by_month = dict(ep_by_month)
+
+    # ── Build monthly time series ───────────────────────────────────────────────
     sparse = sorted(set(
         list(ppt_by_month) + list(pai_by_month) +
         list(av_by_month)  + list(ep_by_month)
@@ -432,9 +514,11 @@ def get_curva_s(tipo: str = "all", ano: int | None = None):
     for m in all_months:
         cum_ppt += ppt_by_month.get(m, 0)
         cum_pai += pai_by_month.get(m, 0)
-        es_futuro = m > hoy
+        es_futuro   = m > hoy
+        ep_has_real = last_ep_month is not None and m <= last_ep_month
         if not es_futuro:
             cum_av += av_by_month.get(m, 0)
+        if ep_has_real:
             cum_ep += ep_by_month.get(m, 0)
 
         result.append({
@@ -442,15 +526,15 @@ def get_curva_s(tipo: str = "all", ano: int | None = None):
             'ppt_usd_mes':  round(ppt_by_month.get(m, 0), 0),
             'pai_metros_mes': round(pai_by_month.get(m, 0), 1),
             'av_metros_mes':  round(av_by_month.get(m, 0), 1) if not es_futuro else None,
-            'ep_usd_mes':     round(ep_by_month.get(m, 0), 0) if not es_futuro else None,
+            'ep_usd_mes':     round(ep_by_month.get(m, 0), 0) if ep_has_real    else None,
             'cum_ppt_usd':    round(cum_ppt, 0),
             'cum_pai_metros': round(cum_pai, 1),
             'cum_av_metros':  round(cum_av, 1)  if not es_futuro else None,
-            'cum_ep_usd':     round(cum_ep, 0)  if not es_futuro else None,
+            'cum_ep_usd':     round(cum_ep, 0)  if ep_has_real   else None,
             'pct_ppt_fin': round(cum_ppt / total_ppt_usd * 100, 1) if total_ppt_usd > 0 else None,
             'pct_pai_fis': round(cum_pai / total_pai * 100, 1)     if total_pai > 0 else None,
             'pct_av_fis':  round(cum_av  / total_pai * 100, 1)     if (not es_futuro and total_pai > 0) else None,
-            'pct_ep_fin':  round(cum_ep  / total_ep_usd * 100, 1)  if (not es_futuro and total_ep_usd > 0) else None,
+            'pct_ep_fin':  round(cum_ep  / total_ep_usd * 100, 1)  if (ep_has_real and total_ep_usd > 0) else None,
             'es_futuro':   es_futuro,
         })
 
@@ -467,38 +551,61 @@ def get_curva_s(tipo: str = "all", ano: int | None = None):
         return sum(month_dict[m] for m in recent) / len(recent) if recent else 0.0
 
     avg_av_rate = _avg_recent_rate(av_by_month, hoy)
-    avg_ep_rate = _avg_recent_rate(ep_by_month, hoy)
+    # Tasa EP: promedio de contratos vigentes hasta el último mes con datos reales
+    avg_ep_rate = _avg_recent_rate(ep_vigent_by_month, last_ep_month or hoy)
 
-    # Find the bridge month: last non-future month in result, and its cumulative actuals
+    # Avance bridge: último mes no futuro
     bridge_month  = None
     cum_av_bridge = 0.0
-    cum_ep_bridge = 0.0
     for item in result:
         if not item['es_futuro']:
             bridge_month  = item['mes']
             cum_av_bridge = float(item['cum_av_metros'] or 0)
-            cum_ep_bridge = float(item['cum_ep_usd']    or 0)
+
+    # EP bridge: último mes con EP real (puede ser anterior a hoy)
+    ep_bridge_month = None
+    cum_ep_bridge   = 0.0
+    for item in result:
+        if item['cum_ep_usd'] is not None:
+            ep_bridge_month = item['mes']
+            cum_ep_bridge   = float(item['cum_ep_usd'])
 
     # Add projection fields to every data point
     for item in result:
         m = item['mes']
+
+        # ── Avance físico (bridge = último mes no futuro) ──────────────────────
         if bridge_month is None or m < bridge_month:
-            item['pct_av_fis_proy'] = None
-            item['pct_ep_fin_proy'] = None
+            item['cum_av_metros_proy'] = None
+            item['pct_av_fis_proy']    = None
         elif m == bridge_month:
-            # Bridge: projected starts where actual ends (continuity)
-            item['pct_av_fis_proy'] = item['pct_av_fis']
+            item['cum_av_metros_proy'] = round(cum_av_bridge, 1)
+            item['pct_av_fis_proy']    = item['pct_av_fis']
+        else:
+            delta_av = _months_diff(bridge_month, m)
+            proj_av  = cum_av_bridge + avg_av_rate * delta_av if avg_av_rate > 0 else None
+            item['cum_av_metros_proy'] = round(min(proj_av, total_pai), 1) if proj_av is not None else None
+            item['pct_av_fis_proy'] = (
+                round(item['cum_av_metros_proy'] / total_pai * 100, 1)
+                if item['cum_av_metros_proy'] is not None and total_pai > 0 else None
+            )
+
+        # ── EP financiero (bridge = último mes con EP real, puede ser < hoy) ───
+        if ep_bridge_month is None or m < ep_bridge_month:
+            item['cum_ep_usd_proy'] = None
+            item['pct_ep_fin_proy'] = None
+        elif m == ep_bridge_month:
+            item['cum_ep_usd_proy'] = round(cum_ep_bridge, 0)
             item['pct_ep_fin_proy'] = item['pct_ep_fin']
         else:
-            # Future: linear projection from bridge using recent rate
-            delta = _months_diff(bridge_month, m)
-            item['pct_av_fis_proy'] = (
-                round(min(cum_av_bridge + avg_av_rate * delta, total_pai) / total_pai * 100, 1)
-                if avg_av_rate > 0 and total_pai > 0 else None
-            )
-            item['pct_ep_fin_proy'] = (
-                round(min(cum_ep_bridge + avg_ep_rate * delta, total_ep_usd) / total_ep_usd * 100, 1)
-                if avg_ep_rate > 0 and total_ep_usd > 0 else None
+            delta_ep = _months_diff(ep_bridge_month, m)
+            proj_ep  = cum_ep_bridge + avg_ep_rate * delta_ep if avg_ep_rate > 0 else None
+            # Cap at PPT (budget), not at historical EP total (which equals the bridge value)
+            ep_ceil  = total_ppt_usd if total_ppt_usd > cum_ep_bridge else proj_ep
+            item['cum_ep_usd_proy']  = round(min(proj_ep, ep_ceil), 0) if proj_ep is not None else None
+            item['pct_ep_fin_proy']  = (
+                round(item['cum_ep_usd_proy'] / total_ppt_usd * 100, 1)
+                if item['cum_ep_usd_proy'] is not None and total_ppt_usd > 0 else None
             )
 
     return {
@@ -509,9 +616,11 @@ def get_curva_s(tipo: str = "all", ano: int | None = None):
             'av_metros':  round(total_av, 1),
             'ep_usd':     round(total_ep_usd, 0),
         },
-        'tiene_ep':      total_ep_usd > 0,
-        'tiene_avance':  total_av > 0,
-        'ep_filter':     ep_filter_info,
-        'avg_av_rate':   round(avg_av_rate, 1),
-        'avg_ep_rate':   round(avg_ep_rate, 0),
+        'tiene_ep':        total_ep_usd > 0,
+        'tiene_avance':    total_av > 0,
+        'ep_filter':       ep_filter_info,
+        'avg_av_rate':     round(avg_av_rate, 1),
+        'avg_ep_rate':     round(avg_ep_rate, 0),
+        'last_ep_month':   last_ep_month,
+        'ep_bridge_month': ep_bridge_month,
     }

@@ -640,10 +640,10 @@ def get_connection_bi() -> pyodbc.Connection:
     return pyodbc.connect(cs)
 
 
-def query_df_bi(sql: str) -> pd.DataFrame:
+def query_df_bi(sql: str, params: tuple = ()) -> pd.DataFrame:
     conn = get_connection_bi()
     try:
-        return pd.read_sql(sql, conn)
+        return pd.read_sql(sql, conn, params=params)
     finally:
         conn.close()
 

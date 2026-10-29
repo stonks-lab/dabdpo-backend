@@ -9,7 +9,6 @@ router = APIRouter(prefix="/alertas", tags=["alertas"])
 @router.get("/kpis")
 def get_kpis():
     bol = load_boletas()
-    av = bol.get("Alerta_Vencimiento") if "Alerta_Vencimiento" in bol.columns else None
     return {
         "contratos_criticos":    len([r for r in alertas_contratos() if r["Estado_Saldo"] == "CRÍTICO"]),
         "contratos_negativos":   len([r for r in alertas_contratos() if r["Estado_Saldo"] == "NEGATIVO"]),
@@ -19,9 +18,29 @@ def get_kpis():
     }
 
 
+@router.get("/filtros")
+def get_filtros():
+    rows = alertas_contratos()
+    return {
+        "areas": sorted({r["Area_contrato"] for r in rows if r.get("Area_contrato")}),
+        "tipos": sorted({r["Tipo_contrato"]  for r in rows if r.get("Tipo_contrato")}),
+    }
+
+
 @router.get("/contratos")
-def get_contratos():
-    return alertas_contratos()
+def get_contratos(
+    area:         str = Query(""),
+    tipo:         str = Query(""),
+    estado_saldo: str = Query(""),
+):
+    rows = alertas_contratos()
+    if area:
+        rows = [r for r in rows if area.lower() in (r.get("Area_contrato") or "").lower()]
+    if tipo:
+        rows = [r for r in rows if tipo.lower() in (r.get("Tipo_contrato") or "").lower()]
+    if estado_saldo:
+        rows = [r for r in rows if r.get("Estado_Saldo") == estado_saldo]
+    return rows
 
 
 @router.get("/boletas")
